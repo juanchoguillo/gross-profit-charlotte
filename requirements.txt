@@ -4,3 +4,4 @@ openpyxl>=3.1
 pyxlsb>=1.0
 plotly>=5.22
 xlsxwriter>=3.2
+numbers-parser>=4.19

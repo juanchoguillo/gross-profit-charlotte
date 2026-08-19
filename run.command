@@ -18,4 +18,4 @@ fi
 
 echo "Starting the dashboard — your browser will open at http://localhost:8501"
 echo "(Leave this window open while you use it. Close it or press Ctrl-C to stop.)"
-exec ./.venv/bin/streamlit run app.py --server.gatherUsageStats false
+exec ./.venv/bin/streamlit run app.py --browser.gatherUsageStats false

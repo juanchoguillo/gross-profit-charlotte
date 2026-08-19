@@ -10,6 +10,9 @@ value cached so pandas / the saved-report viewer still read plain numbers):
                    manager rows sum their reps; the grand total sums the reps.
   Fixed rate     — one editable cell on the cover sheet (named "FixedRate")
                    drives every Fixed Cost / Overhead formula in the book.
+                   (The fab $/SqFt rate is shown on the cover for reference only:
+                   Fab Cost is a base column, since orders with a Production LOG
+                   amount keep it instead of the rate.)
   Other sheets   — customer-type and operational tables aggregate the orders
                    sheet; ratio columns (Avg $, margins) are formulas.
 
@@ -192,7 +195,8 @@ def _q(sheet: str) -> str:
 # --------------------------------------------------------------------------
 # cover sheet — logo, report info, the editable FixedRate cell, live KPIs
 # --------------------------------------------------------------------------
-def _cover(wb, F, *, subtitle, period, group_by, basis_label, fixed_rate, kpis):
+def _cover(wb, F, *, subtitle, period, group_by, basis_label, fixed_rate, kpis,
+           fab_rate=0.0, install_rate=0.0):
     ws = wb.add_worksheet(COVER_SHEET)
     ws.set_tab_color(GOLD)
     ws.hide_gridlines(2)
@@ -207,8 +211,12 @@ def _cover(wb, F, *, subtitle, period, group_by, basis_label, fixed_rate, kpis):
     ws.write("D4", "Gross Profit Report", F.get(bold=True, color=GOLD, size=16))
     ws.write("D5", subtitle, F.get(color=TEXT, italic=True))
     meta = [("Period", period), ("Grouped by", group_by),
-            ("Income basis", basis_label),
-            ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M"))]
+            ("Income basis", basis_label)]
+    if fab_rate:
+        meta.append(("Fab cost $/SqFt", f"${float(fab_rate):,.2f}"))
+    if install_rate:
+        meta.append(("Install cost $/SqFt", f"${float(install_rate):,.2f}"))
+    meta.append(("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")))
     for i, (lbl, val) in enumerate(meta):
         ws.write(6 + i, 3, lbl, F.get(bold=True, color=NAVY))
         ws.write(6 + i, 4, str(val), F.get(color=TEXT))
@@ -246,7 +254,8 @@ def _cover(wb, F, *, subtitle, period, group_by, basis_label, fixed_rate, kpis):
 # --------------------------------------------------------------------------
 # summary column -> the matching orders-sheet column, by (display, internal) name
 _SUM_FIELDS = ["SqFtBilled", "SqFtAllocated", "Income", "MaterialCost",
-               "TemplateCost", "InstallCost", "FabricationCost"]
+               "TemplateCost", "InstallCost", "FabricationCost", "PlumbingCost",
+               "AdditionalCost"]
 
 
 def _summary_sheet(wb, F, name, df, *, orders_sheet, orders_col, crit_col,
@@ -293,7 +302,8 @@ def _summary_sheet(wb, F, name, df, *, orders_sheet, orders_col, crit_col,
             return None
         if c == "OperationalCost":
             return (f"={letters['TemplateCost']}{xr}+{letters['InstallCost']}{xr}"
-                    f"+{letters['FabricationCost']}{xr}")
+                    f"+{letters['FabricationCost']}{xr}+{letters['PlumbingCost']}{xr}"
+                    f"+{letters['AdditionalCost']}{xr}")
         if c == "Overhead":
             return f"={letters['SqFtBilled']}{xr}*FixedRate"
         if c == "TotalCost":
@@ -343,7 +353,8 @@ def _orders_sheet(wb, F, df):
                     f"-{L['Credit Memo']}{xr}")
         if c == "Total Direct Cost":
             return (f"={L['Material Cost']}{xr}+{L['Template Cost']}{xr}"
-                    f"+{L['Install Cost']}{xr}+{L['Fab Cost']}{xr}")
+                    f"+{L['Install Cost']}{xr}+{L['Fab Cost']}{xr}"
+                    f"+{L['Plumbing Cost']}{xr}+{L['Additional Costs']}{xr}")
         if c == "Gross Profit ($)":
             return f"={L['Net Sales']}{xr}-{L['Total Direct Cost']}{xr}"
         if c == "GP Margin %":
@@ -414,8 +425,10 @@ def _simple_sheet(wb, F, name, df, *, databars=(), avg=True, fill_of=_zebra,
 
 def build_full_export(orders_nm, summary, by_material, by_color, by_customer_type,
                       by_service_group, op_diag_df, mapping_df, group_by, *,
-                      fixed_rate=0.0, income_basis="billed", period="",
-                      basis_label="", subtitle=None):
+                      fixed_rate=0.0, fab_rate=0.0, install_rate=0.0,
+                      income_basis="billed", period="",
+                      basis_label="", subtitle=None,
+                      by_other=None, other_lines=None):
     """One workbook mirroring every dashboard tab — cover + one sheet per tab,
     with live formulas throughout (see module docstring)."""
     orders = orders_nm.copy()
@@ -453,7 +466,8 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
     ]
     _cover(wb, F, subtitle=subtitle or "Full report — one sheet per dashboard tab",
            period=period, group_by=group_by, basis_label=basis_label or income_basis,
-           fixed_rate=fixed_rate, kpis=kpis)
+           fixed_rate=fixed_rate, fab_rate=fab_rate, install_rate=install_rate,
+           kpis=kpis)
 
     if summary is not None and len(summary):
         _summary_sheet(wb, F, f"Summary by {group_by}", summary,
@@ -464,7 +478,9 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
                                    "MaterialCost": ocols["Material Cost"],
                                    "TemplateCost": ocols["Template Cost"],
                                    "InstallCost": ocols["Install Cost"],
-                                   "FabricationCost": ocols["Fab Cost"]},
+                                   "FabricationCost": ocols["Fab Cost"],
+                                   "PlumbingCost": ocols["Plumbing Cost"],
+                                   "AdditionalCost": ocols["Additional Costs"]},
                        crit_col=ocols["Sales Person"],
                        income_dynamic=(income_basis == "billed"))
 
@@ -476,6 +492,19 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
     if by_color is not None and len(by_color):
         _simple_sheet(wb, F, "Countertop Colors", by_color,
                       databars=[("Revenue", GOLD)], widths={"Color": 35.5})
+
+    # The "Other" material bucket, opened up: what the uncategorised SKUs are,
+    # then every line of them with the order it was billed on.
+    if by_other is not None and len(by_other):
+        _simple_sheet(wb, F, "Other Breakdown", by_other,
+                      databars=[("Revenue", GOLD)],
+                      widths={"SKU": 16, "Description": 46})
+    if other_lines is not None and len(other_lines):
+        _simple_sheet(wb, F, "Other — Detail",
+                      other_lines.drop(columns=["OrderID"], errors="ignore"),
+                      databars=[("Revenue", GOLD)],
+                      widths={"Order #": 14, "Customer": 30, "SKU": 16,
+                              "Description": 46})
 
     if by_customer_type is not None and len(by_customer_type):
         ct = by_customer_type.reset_index(drop=True)
@@ -503,7 +532,8 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
     if by_service_group is not None and len(by_service_group):
         sg = by_service_group.reset_index(drop=True)
         col_by_group = {"Template": "Template Cost", "Install": "Install Cost",
-                        "Fabrication": "Fab Cost"}
+                        "Fabrication": "Fab Cost", "Plumbing": "Plumbing Cost",
+                        "Additional": "Additional Costs"}
 
         def sg_formula(i, _j, c, _xr):
             oc = col_by_group.get(str(sg.iloc[i].get("Group", "")))
@@ -516,8 +546,12 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
         od = op_diag_df.reset_index(drop=True)
         odL = {c: xl_col_to_name(j) for j, c in enumerate(od.columns)}
         applied = "Cost applied (period)"
-        col_by_type = {"Template": "Template Cost", "Install": "Install Cost",
-                       "Fabrication": "Fab Cost"}
+        # Only Template gets a live SUM(): every other cost column can also carry
+        # cost the file didn't supply — Fab Cost from the $/SqFt rate, Install
+        # Cost from the install-total spread, Additional Costs typed by hand — so
+        # SUM()ing them would overstate the file. Those rows keep the engine's
+        # file-only figure as a plain number.
+        col_by_type = {"Template": "Template Cost"}
 
         def od_formula(i, _j, c, xr):
             t = str(od.iloc[i].get("Type", ""))
@@ -550,10 +584,12 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
 # layout (columns + names) as the full report.
 # --------------------------------------------------------------------------
 def build_report_excel(orders_nm, summary, by_material, by_customer_type,
-                       by_service_group, group_by, *, fixed_rate=0.0,
-                       income_basis="billed", period="", basis_label=""):
+                       by_service_group, group_by, *, fixed_rate=0.0, fab_rate=0.0,
+                       install_rate=0.0, income_basis="billed", period="",
+                       basis_label=""):
     return build_full_export(
         orders_nm, summary, by_material, None, by_customer_type,
         by_service_group, None, None, group_by,
-        fixed_rate=fixed_rate, income_basis=income_basis, period=period,
-        basis_label=basis_label, subtitle=f"Summary report by {group_by}")
+        fixed_rate=fixed_rate, fab_rate=fab_rate, install_rate=install_rate,
+        income_basis=income_basis, period=period, basis_label=basis_label,
+        subtitle=f"Summary report by {group_by}")

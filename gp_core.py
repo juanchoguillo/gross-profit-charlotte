@@ -15,9 +15,20 @@ Data model (per Juan's spec):
                             other  -> AllocationQty * UnitCost (sqft = 0)
                          stone vs other comes from Products "Catalogs"
   SqFt Allocated       = stone AllocationMeasure
-  Operational Cost     = Template + Install + Fabrication cost per order, pulled
-                         from the three schedule workbooks (one tab per crew
-                         member), joined on the numeric OrderID
+  Operational Cost     = Template + Install + Fabrication + Plumbing +
+                         Additional, per order. Template / Install / Fabrication
+                         are pulled from the three schedule workbooks (one tab
+                         per crew member), joined on the numeric OrderID;
+                         Additional also picks up the vendor bill exports
+                         (order id read out of the bill Memo); Plumbing is typed
+                         per order in the app (no source export carries it).
+  Fabrication Cost     = the Production LOG amount when the order has one,
+                         otherwise SqFt Billed * fab_rate (the fab fixed cost
+                         $/sqft, default 0 -> no fallback)
+  Install Cost         = the Install Schedule amount when the order has one,
+                         otherwise its share of install_total -- that pot spread
+                         over the stone sqft of the orders the schedule misses
+                         (default 0 -> no fallback)
   Overhead             = SqFt Billed * overhead_rate (default 0, editable)
   Total Cost           = Material + Operational + Overhead
   Profit               = Income - Total Cost ;  Margin = Profit / Income
@@ -30,6 +41,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import warnings
 from dataclasses import dataclass, field
 
@@ -65,7 +77,8 @@ OVERRIDES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Operational Cost, Overhead, Profit, Margin) is recomputed from these.
 EDITABLE_ORDER_FIELDS = [
     "TotalInvoice", "SalesTax", "SqFtBilled", "SqFtAllocated", "MaterialCost",
-    "TemplateCost", "InstallCost", "FabricationCost",
+    "TemplateCost", "InstallCost", "FabricationCost", "PlumbingCost",
+    "AdditionalCost",
 ]
 
 
@@ -167,6 +180,55 @@ def diff_order_overrides(parsed: dict, base_orders: pd.DataFrame, overrides: dic
                     "skipped_missing": skipped_missing}
 
 
+def _fab_cost(o: pd.DataFrame, cfg: Config) -> pd.Series:
+    """Fab Cost per order: the Production LOG amount where the order has one,
+    otherwise stone sqft x the fab fixed rate. With no LOG loaded every order is
+    rate-based; with a rate of 0 only the logged orders carry fab cost."""
+    log = o["FabFromLog"] if "FabFromLog" in o.columns else 0.0
+    return pd.Series(np.where(log != 0, log, o["SqFtBilled"] * cfg.fab_rate),
+                     index=o.index, dtype=float)
+
+
+def install_manual_mask(orders: pd.DataFrame, overrides: dict) -> pd.Series:
+    """Orders whose Install Cost was typed in by hand — they keep that amount and
+    sit outside the install-total split."""
+    manual = pd.Series(False, index=orders.index)
+    if not overrides:
+        return manual
+    ids = _norm_id(orders["OrderID"])
+    for oid, entry in overrides.items():
+        if "InstallCost" in entry.get("fields", {}):
+            manual |= ids == str(oid)
+    return manual
+
+
+def install_spread(o: pd.DataFrame, cfg: Config, covered: pd.Series) -> tuple[float, float]:
+    """(rate, sqft) for the install total pot — `cfg.install_total` divided by the
+    stone sqft of every order the Install Schedule doesn't cover. `covered` marks
+    the orders that already have an install cost (from the schedule or typed in
+    by hand); they neither draw from the pot nor dilute the rate."""
+    if cfg.install_total <= 0:
+        return 0.0, 0.0
+    sqft = float(o.loc[~covered, "SqFtBilled"].sum())
+    return (cfg.install_total / sqft if sqft > 0 else 0.0), sqft
+
+
+def _install_cost(o: pd.DataFrame, cfg: Config,
+                  manual: pd.Series | None = None) -> pd.Series:
+    """Install Cost per order: the Install Schedule amount where the order has
+    one, otherwise the order's share of the install total pot (stone sqft x the
+    rate `install_spread` derives). Orders with a hand-typed install cost count
+    as covered — the caller keeps their typed value."""
+    src = (o["InstallFromFile"] if "InstallFromFile" in o.columns
+           else pd.Series(0.0, index=o.index))
+    covered = src.ne(0)
+    if manual is not None:
+        covered = covered | manual
+    rate, _ = install_spread(o, cfg, covered)
+    return pd.Series(np.where(covered, src, o["SqFtBilled"] * rate),
+                     index=o.index, dtype=float)
+
+
 def apply_order_overrides(orders: pd.DataFrame, overrides: dict, cfg: Config) -> pd.DataFrame:
     """Overlay saved manual edits onto the per-order frame and recompute the
     derived columns. The credit-memo effect baked into NetSales is preserved:
@@ -178,6 +240,8 @@ def apply_order_overrides(orders: pd.DataFrame, overrides: dict, cfg: Config) ->
         return o
     credit_memo = o["TotalInvoice"] - o["SalesTax"] - o["NetSales"]
     ids = _norm_id(o["OrderID"])
+    fab_manual = pd.Series(False, index=o.index)     # fab typed in by hand
+    inst_manual = pd.Series(False, index=o.index)    # install typed in by hand
     for oid, entry in overrides.items():
         mask = ids == str(oid)
         if not mask.any():
@@ -185,11 +249,24 @@ def apply_order_overrides(orders: pd.DataFrame, overrides: dict, cfg: Config) ->
         for col, val in entry.get("fields", {}).items():
             if col in EDITABLE_ORDER_FIELDS:
                 o.loc[mask, col] = float(val)
+                if col == "FabricationCost":
+                    fab_manual |= mask
+                elif col == "InstallCost":
+                    inst_manual |= mask
         o.loc[mask, "Edited"] = True
     o["NetSales"] = o["TotalInvoice"] - o["SalesTax"] - credit_memo
     if cfg.income_basis == "billed":
         o["Income"] = o["NetSales"]
-    o["OperationalCost"] = o["TemplateCost"] + o["InstallCost"] + o["FabricationCost"]
+    # A hand-typed Fab Cost stays as typed; every other order re-derives from the
+    # LOG / fab rate, so editing Sq Ft (Stone) moves the rate-based fab cost too.
+    o["FabricationCost"] = o["FabricationCost"].where(fab_manual, _fab_cost(o, cfg))
+    # Same for Install: a typed amount stays, and it takes that order out of the
+    # install-total pot, so the remaining orders re-share what is left.
+    o["InstallCost"] = o["InstallCost"].where(inst_manual,
+                                              _install_cost(o, cfg, inst_manual))
+    o["OperationalCost"] = (o["TemplateCost"] + o["InstallCost"]
+                            + o["FabricationCost"] + o["PlumbingCost"]
+                            + o["AdditionalCost"])
     o["Overhead"] = o["SqFtBilled"] * cfg.overhead_rate
     o["TotalCost"] = o["MaterialCost"] + o["OperationalCost"] + o["Overhead"]
     o["Profit"] = o["Income"] - o["TotalCost"]
@@ -197,46 +274,8 @@ def apply_order_overrides(orders: pd.DataFrame, overrides: dict, cfg: Config) ->
     return o
 
 # --------------------------------------------------------------------------
-# Configuration (defaults; rep->shop/manager can be overridden by a map file)
+# Configuration (rep->shop/manager comes from the mapping file or the in-app editor)
 # --------------------------------------------------------------------------
-
-# Sales rep -> Shop (authoritative list from Juan, 2026-07-08 — no mapping
-# file needed; still overridable in-app or via an optional mapping upload)
-DEFAULT_SHOP_MAP = {
-    "April Glenn": "Blue Ridge",
-    "Joy Buckner": "Blue Ridge",
-    "Carlos Lombera": "Jasper",
-    "Cassandra Yoke": "Jasper",
-    "Courtney Enix": "Jasper",
-    "Robert Steel": "Jasper",
-    "Sylvia Berrios": "Jasper",
-    "Teresa Lozano": "Jasper",
-    "Cynthia Donette": "Kennesaw",
-    "Dwayne Parrott": "Kennesaw",
-    "Elias Rodriguez": "Kennesaw",
-    "Erin Behnke": "Kennesaw",
-    "Esther Leal": "Kennesaw",
-    "Gabriel Hernandez": "Kennesaw",
-    "Karrie Newell": "Kennesaw",
-    "Kate Hunt": "Kennesaw",
-    "Lorena Soto": "Kennesaw",
-    "Luciano Lombera": "Kennesaw",
-    "Maryori Velasquez": "Kennesaw",
-    "Mel Kavanagh": "Kennesaw",
-    "Miguel Lombera": "Kennesaw",
-    "Phalyssa Brown": "Kennesaw",
-    "Susan Farantatos": "Kennesaw",
-}
-
-# Shop -> Manager (authoritative list from Juan, 2026-07-08); each rep inherits
-# the manager of their shop.
-DEFAULT_SHOP_MANAGERS = {
-    "Kennesaw": "Luciano Lombera",
-    "Blue Ridge": "Manuel Mogollon",
-    "Jasper": "Carlos Lombera",
-}
-DEFAULT_MANAGER_MAP = {rep: DEFAULT_SHOP_MANAGERS[shop]
-                       for rep, shop in DEFAULT_SHOP_MAP.items()}
 
 # Catalogs first word that means "stone slab material" (per Juan's authoritative
 # list of stone Catalogs values, 2026-06-17). Compared case-insensitively.
@@ -250,9 +289,11 @@ UNKNOWN = "Unknown"
 
 @dataclass
 class Config:
-    shop_map: dict = field(default_factory=lambda: dict(DEFAULT_SHOP_MAP))
-    manager_map: dict = field(default_factory=lambda: dict(DEFAULT_MANAGER_MAP))  # rep -> manager
+    shop_map: dict = field(default_factory=dict)          # rep -> shop
+    manager_map: dict = field(default_factory=dict)       # rep -> manager
     overhead_rate: float = 0.0
+    fab_rate: float = 0.0                             # $/stone sqft fab fixed cost
+    install_total: float = 0.0                        # $ pot spread over uncovered orders
     income_basis: str = "billed"                      # "paid" | "billed"
 
 
@@ -260,8 +301,40 @@ class Config:
 # File identification & loading
 # --------------------------------------------------------------------------
 
+def _read_numbers(data: bytes) -> pd.DataFrame:
+    """Apple Numbers workbook -> DataFrame, using its largest table.
+
+    numbers-parser only opens a real path, so the bytes go to a temp file."""
+    from numbers_parser import Document
+
+    fd, tmp = tempfile.mkstemp(suffix=".numbers")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        best = None
+        for sheet in Document(tmp).sheets:
+            for table in sheet.tables:
+                rows = table.rows(values_only=True)
+                if len(rows) > 1 and (best is None or len(rows) > len(best)):
+                    best = rows
+        if best is None:
+            raise ValueError("no table with data")
+    finally:
+        os.unlink(tmp)
+
+    header = ["" if v is None else str(v).strip() for v in best[0]]
+    df = pd.DataFrame(best[1:], columns=header)
+    df = df.loc[:, [c for c in df.columns if c]]      # drop spacer columns
+    for c in df.columns:
+        df[c] = df[c].map(lambda v: "" if v is None or pd.isna(v) else str(v).strip())
+    return df[~(df == "").all(axis=1)].reset_index(drop=True)
+
+
 def _read_any(src, name: str) -> pd.DataFrame:
-    is_xlsx = str(name).lower().endswith((".xlsx", ".xlsm", ".xls"))
+    low = str(name).lower()
+    is_xlsx = low.endswith((".xlsx", ".xlsm", ".xls"))
+    if low.endswith(".numbers"):
+        return _read_numbers(src.read() if hasattr(src, "read") else open(src, "rb").read())
     if hasattr(src, "read"):
         data = src.read()
         if is_xlsx:
@@ -308,6 +381,22 @@ def identify(df: pd.DataFrame) -> str | None:
     return best
 
 
+def _promote_header(df: pd.DataFrame, scan: int = 12) -> tuple[pd.DataFrame, int] | None:
+    """Rescue exports that carry a title/summary preamble above the real header.
+
+    Some ERP reports (e.g. Invoice List) put a grand total on row 1 and a blank
+    row under it, so pandas takes that junk as the column names. Scan the first
+    rows for one that *is* a recognised header and re-key the frame on it."""
+    for i in range(min(scan, len(df))):
+        cols = [str(v).strip() for v in df.iloc[i].tolist()]
+        probe = pd.DataFrame(columns=cols)
+        if identify(probe):
+            out = df.iloc[i + 1:].copy()
+            out.columns = cols
+            return out.reset_index(drop=True), i + 1
+    return None
+
+
 def load_files(sources: list[tuple]) -> tuple[dict, list]:
     collected: dict = {}
     opcost: dict = {}        # role -> {'map': Series, 'diag': {...}}
@@ -331,12 +420,17 @@ def load_files(sources: list[tuple]) -> tuple[dict, list]:
                 opcost[role]["diag"]["rows"] += payload["diag"]["rows"]
                 opcost[role]["diag"]["sheets"] += payload["diag"]["sheets"]
                 opcost[role]["diag"]["total_in_file"] += payload["diag"]["total_in_file"]
+                opcost[role]["diag"]["vendors"] = sorted(
+                    set(opcost[role]["diag"].get("vendors", []))
+                    | set(payload["diag"].get("vendors", [])))
                 opcost[role]["diag"]["orders_in_file"] = int(opcost[role]["map"].size)
             else:
                 opcost[role] = payload
             d = payload["diag"]
+            who = f" ({', '.join(d['vendors'])})" if d.get("vendors") else ""
             notes.append(f"{d['label']} cost: {d['rows']:,} rows from "
-                         f"{len(d['sheets'])} crew tab(s)")
+                         f"{len(d['sheets'])} "
+                         f"{_OPCOST_SPECS[role].get('tab_word', 'crew tab(s)')}{who}")
             continue
         try:
             df = _read_any(io.BytesIO(raw), name)
@@ -345,8 +439,13 @@ def load_files(sources: list[tuple]) -> tuple[dict, list]:
             continue
         role = identify(df)
         if not role:
-            notes.append(name)
-            continue
+            promoted = _promote_header(df)
+            if promoted is None:
+                notes.append(name)
+                continue
+            df, hdr_row = promoted
+            role = identify(df)
+            notes.append(f"{name}: header found on row {hdr_row + 1} (skipped preamble)")
         collected.setdefault(role, []).append((name, df))
 
     found: dict = {}
@@ -362,6 +461,23 @@ def load_files(sources: list[tuple]) -> tuple[dict, list]:
             notes.append(f"{role}: used '{name}', ignored others (avoid double-count)")
     found.update(opcost)
     return found, notes
+
+
+def load_rep_map_file(path: str) -> tuple[dict, dict]:
+    """Read a rep -> shop/manager mapping file from disk.
+
+    Returns ({}, {}) when the file is missing, unreadable, or isn't a mapping
+    file, so a bad template never takes the dashboard down."""
+    try:
+        df = _read_any(path, os.path.basename(path))
+    except Exception:  # noqa: BLE001
+        return {}, {}
+    if not _is_rep_map(df):
+        promoted = _promote_header(df)
+        if promoted is None or not _is_rep_map(promoted[0]):
+            return {}, {}
+        df = promoted[0]
+    return parse_rep_map(df)
 
 
 def parse_rep_map(df: pd.DataFrame) -> tuple[dict, dict]:
@@ -412,9 +528,9 @@ def _blankish(v) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Operational-cost schedule workbooks (Template / Install / Fabrication)
+# Operational-cost workbooks (Template / Install / Fabrication / Additional)
 # --------------------------------------------------------------------------
-# These three are multi-sheet workbooks with one tab per crew member; the
+# The first three are multi-sheet workbooks with one tab per crew member; the
 # per-order cost is summed across every qualifying tab (and across repeat visits
 # to the same order). They don't fit the single-sheet column-signature path, so
 # they get a dedicated reader. Aggregate/summary tabs are skipped so nothing is
@@ -422,15 +538,18 @@ def _blankish(v) -> bool:
 _OPCOST_SPECS = {
     "template_cost": {
         "label": "Template",
-        "order_aliases": ["order no.", "order no", "order #", "order#"],
-        # Per Order = Temple $ + mileage + other fees = all-in paid to templater.
-        "value_aliases": ["per order", "temple $", "template $"],
-        "guard_aliases": ["per order", "temple $", "template $"],
+        "order_aliases": ["order id", "order no.", "order no", "order #", "order#"],
+        # Newer 'Templater_<name>' tabs settle the all-in figure in "Total Final
+        # Paid"; older ones carry "Per Order" (= Temple $ + mileage + other fees).
+        "value_aliases": ["total final paid", "per order", "temple $", "template $"],
+        "guard_aliases": ["total final paid", "per order", "temple $", "template $"],
     },
     "install_cost": {
         "label": "Install",
-        "order_aliases": ["order #", "order#", "order no.", "order no"],
-        "value_aliases": ["total"],
+        "order_aliases": ["order id", "order #", "order#", "order no.", "order no"],
+        # "Total Final Paid" is what actually left the bank (it applies the
+        # "descuentos" adjustments); "Total" is the pre-adjustment figure.
+        "value_aliases": ["total final paid", "total"],
         # "SQF Paid" only exists on the real per-installer tabs, not the overview.
         "guard_aliases": ["sqf paid"],
     },
@@ -441,6 +560,19 @@ _OPCOST_SPECS = {
         "guard_aliases": ["total amount"],
         "year_sheets_only": True,        # only the "2026"-style production tab
     },
+    # Vendor bill exports (QuickBooks "transaction detail" shape) that bill a
+    # third-party service per job — e.g. HydroShield sealing. They carry no order
+    # column at all: the order number is written into the free-text Memo
+    # ("sealing service  Bizops 30006"), so the key is read out of that.
+    "additional_cost": {
+        "label": "Additional",
+        "order_aliases": ["memo", "description"],
+        "value_aliases": ["debit", "amount", "paid amount"],
+        "guard_aliases": ["debit", "amount", "paid amount"],
+        "order_from_memo": True,
+        "read_all_sheets": True,         # a one-tab export, often named "Sheet1"
+        "tab_word": "tab(s)",
+    },
 }
 
 # Tabs that aggregate/duplicate the per-person tabs -> skip to avoid double count.
@@ -448,11 +580,55 @@ _OPCOST_SKIP_SHEET = re.compile(
     r"^\s*sheet\s*\d+\s*$|total\s*payment|consolidate|production\s*list", re.I)
 _YEAR_SHEET = re.compile(r"^\s*20\d\d\s*$")
 
+# Newer schedule workbooks name every crew tab 'Installer_<name>' /
+# 'Templater_<name>' and ship the raw ERP tabs (Invoice List, Sales Person
+# Summary, ...) in the same file. Those run to ~1M rows and carry an "Order Id"
+# column of their own, so once a workbook names its crew tabs this way we read
+# *only* those tabs -- never the rest.
+# The underscore is required: it separates the crew tabs from aggregate tabs
+# such as the Production LOG's 'INSTALLS-2026'.
+_CREW_SHEET_RE = {
+    "install_cost": re.compile(r"^\s*installers?_", re.I),
+    "template_cost": re.compile(r"^\s*templat(?:e|er|ers)?_", re.I),
+}
+
+
+def _crew_sheets(book, role) -> list:
+    rx = _CREW_SHEET_RE.get(role)
+    return [s for s in book.sheet_names if rx.match(str(s))] if rx else []
+
+
+# Rows the crew tabs use to break up the list rather than to bill an order: a
+# month banner ('2026-06-01'), an invoice banner ('INVOICE #2001') and the
+# footer 'TOTAL' row -- which repeats the tab's own sum and would otherwise
+# double every crew member's cost.
+_NOT_AN_ORDER = re.compile(r"invoice|total|^\s*\d{4}-\d{2}-\d{2}", re.I)
+
 
 def _order_key(v) -> str | None:
     """An order reference -> the numeric OrderID used across the ERP exports.
-    'SOU-76926' -> '76926', 'K4P-74213' -> '74213', '76926' -> '76926'."""
-    nums = re.findall(r"\d+", str(v))
+    'SOU-76926' -> '76926', 'K4P-74213' -> '74213', '76926' -> '76926'.
+    Separator rows return None so their amounts are dropped, not misfiled."""
+    text = str(v)
+    if _NOT_AN_ORDER.search(text):
+        return None
+    nums = re.findall(r"\d+", text)
+    return nums[-1] if nums else None
+
+
+# An order number written into a bill memo, e.g. "sealing service  Bizops 30006"
+# or "sealing service  Bizops JEN 29609". ERP OrderIDs run 4-7 digits.
+_MEMO_ORDER_RE = re.compile(r"(?<!\d)(\d{4,7})(?!\d)")
+
+
+def _memo_order_key(v) -> str | None:
+    """The OrderID embedded in a free-text bill memo. Vendors type the order
+    number in with the job description, so the last 4-7 digit run wins. A memo
+    that names the customer instead of the job ("Bizops Michele Blair") yields
+    None and the line is left unassigned rather than misfiled."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    nums = _MEMO_ORDER_RE.findall(str(v))
     return nums[-1] if nums else None
 
 
@@ -471,7 +647,7 @@ def _pick_col(df: pd.DataFrame, aliases):
 def _find_header_row(book, sheet, engine, order_aliases) -> int | None:
     """Find the row that holds the column headers (these workbooks often carry a
     banner row, e.g. '2026', above the real header)."""
-    raw = pd.read_excel(book, sheet, header=None, nrows=8, engine=engine)
+    raw = pd.read_excel(book, sheet, header=None, nrows=12, engine=engine)
     for i in range(len(raw)):
         vals = {str(x).strip().lower() for x in raw.iloc[i].tolist()}
         if any(a in vals for a in order_aliases):
@@ -482,6 +658,10 @@ def _find_header_row(book, sheet, engine, order_aliases) -> int | None:
 def _classify_opcost(book, engine) -> str | None:
     """Decide whether a workbook is the Template / Install / Fabrication schedule
     by sniffing the column names present on any of its sheets."""
+    for role, rx in _CREW_SHEET_RE.items():
+        if any(rx.match(str(s)) for s in book.sheet_names):
+            return role
+
     cols = set()
     for sheet in book.sheet_names[:30]:
         try:
@@ -501,6 +681,11 @@ def _classify_opcost(book, engine) -> str | None:
         return "install_cost"
     if "total amount" in cols and "order" in cols:
         return "fabrication_cost"
+    # Vendor bill export: no order column, the order number lives in the Memo.
+    # Guarded on the accounting columns around it so a stray "Memo" elsewhere
+    # can't claim the file.
+    if "memo" in cols and has("debit", "amount") and has("type", "split", "num"):
+        return "additional_cost"
     return None
 
 
@@ -522,8 +707,12 @@ def parse_opcost_workbook(raw: bytes, name: str):
 
     per_order: dict = {}
     sheets_used, rows_used, total_in_file = [], 0, 0.0
-    for sheet in book.sheet_names:
-        if _OPCOST_SKIP_SHEET.search(str(sheet)):
+    vendors: list = []
+    crew = _crew_sheets(book, role)
+    keyfn = _memo_order_key if spec.get("order_from_memo") else _order_key
+    for sheet in (crew or book.sheet_names):
+        if (not crew and not spec.get("read_all_sheets")
+                and _OPCOST_SKIP_SHEET.search(str(sheet))):
             continue
         if spec.get("year_sheets_only") and not _YEAR_SHEET.match(str(sheet)):
             continue
@@ -536,7 +725,7 @@ def parse_opcost_workbook(raw: bytes, name: str):
         vc = _pick_col(df, spec["value_aliases"])
         if oc is None or vc is None or _pick_col(df, spec["guard_aliases"]) is None:
             continue
-        keys = df[oc].map(_order_key)
+        keys = df[oc].map(keyfn)
         vals = _num(df[vc])
         keep = keys.notna() & vals.notna()
         for k, v in zip(keys[keep], vals[keep]):
@@ -544,12 +733,17 @@ def parse_opcost_workbook(raw: bytes, name: str):
         sheets_used.append(str(sheet))
         rows_used += int(keep.sum())
         total_in_file += float(vals[keep].sum())
+        nc = _pick_col(df, ["name", "vendor", "payee"])
+        if nc is not None:
+            vendors += [str(x).strip() for x in df.loc[keep, nc].dropna().unique()
+                        if str(x).strip()]
 
     if not per_order:
         return None
     series = pd.Series(per_order, dtype=float)
     diag = {"label": spec["label"], "sheets": sheets_used, "rows": rows_used,
-            "orders_in_file": int(series.size), "total_in_file": total_in_file}
+            "orders_in_file": int(series.size), "total_in_file": total_in_file,
+            "vendors": sorted(set(vendors))}
     return role, {"map": series, "diag": diag}
 
 
@@ -633,6 +827,8 @@ class Report:
     rep_detail: pd.DataFrame          # one row per (shop, manager, rep)
     by_material: pd.DataFrame
     by_color: pd.DataFrame            # stone colors (Products Title), by revenue
+    by_other: pd.DataFrame            # the "Other" bucket, one row per SKU
+    other_lines: pd.DataFrame         # every "Other" line + the order it sits on
     by_customer_type: pd.DataFrame
     by_service_group: pd.DataFrame
     periods: list
@@ -640,8 +836,8 @@ class Report:
 
 
 VALUE_COLS = ["SqFtBilled", "SqFtAllocated", "Income", "MaterialCost",
-              "TemplateCost", "InstallCost", "FabricationCost",
-              "OperationalCost", "Overhead", "TotalCost", "Profit"]
+              "TemplateCost", "InstallCost", "FabricationCost", "PlumbingCost",
+              "AdditionalCost", "OperationalCost", "Overhead", "TotalCost", "Profit"]
 
 
 def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
@@ -773,12 +969,14 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
         al_id_sample = list(nonblank.drop_duplicates().head(10))
         inv_id_sample = sorted(month_orders)[:10]
 
-    # ---- Operational cost = Template + Install + Fabrication, joined by order ----
+    # ---- Operational cost = Template + Install + Fabrication + Additional,
+    # joined by order ----
     def _opmap(role):
         return data[role]["map"] if role in data else pd.Series(dtype=float)
     template_by_order = _opmap("template_cost")
     install_by_order = _opmap("install_cost")
     fab_by_order = _opmap("fabrication_cost")
+    additional_by_order = _opmap("additional_cost")
 
     # ---- Per-order frame ----
     o = pd.DataFrame({"OrderID": sorted(month_orders)})
@@ -802,9 +1000,25 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     o["MaterialCost"] = o["OrderID"].map(matcost_by_order).fillna(0)
     o["SqFtAllocated"] = o["OrderID"].map(sqftalloc_by_order).fillna(0)
     o["TemplateCost"] = o["OrderID"].map(template_by_order).fillna(0)
-    o["InstallCost"] = o["OrderID"].map(install_by_order).fillna(0)
-    o["FabricationCost"] = o["OrderID"].map(fab_by_order).fillna(0)
-    o["OperationalCost"] = o["TemplateCost"] + o["InstallCost"] + o["FabricationCost"]
+    # Install cost: the Install Schedule amount wins wherever the order has one;
+    # the rest share the install total pot by stone sqft. InstallFromFile is kept
+    # so the file's own contribution stays separable in the diagnostics.
+    o["InstallFromFile"] = o["OrderID"].map(install_by_order).fillna(0)
+    o["InstallCost"] = _install_cost(o, cfg)
+    # Fab cost: the Production LOG amount wins wherever the order has one; every
+    # other order falls back to the fab fixed rate x stone sqft. FabFromLog is
+    # kept so an edit to Sq Ft (Stone) re-drives the rate-based orders only.
+    o["FabFromLog"] = o["OrderID"].map(fab_by_order).fillna(0)
+    o["FabricationCost"] = _fab_cost(o, cfg)
+    # Plumbing has no source export — it is typed per order in the Orders tab
+    # and stored in order_overrides.json. Additional comes from the vendor bill
+    # exports and can be overridden (or typed from scratch) the same way.
+    o["PlumbingCost"] = 0.0
+    o["AdditionalFromFile"] = o["OrderID"].map(additional_by_order).fillna(0)
+    o["AdditionalCost"] = o["AdditionalFromFile"]
+    o["OperationalCost"] = (o["TemplateCost"] + o["InstallCost"]
+                            + o["FabricationCost"] + o["PlumbingCost"]
+                            + o["AdditionalCost"])
     o["Overhead"] = o["SqFtBilled"] * cfg.overhead_rate
     o["TotalCost"] = o["MaterialCost"] + o["OperationalCost"] + o["Overhead"]
     o["Profit"] = o["Income"] - o["TotalCost"]
@@ -845,6 +1059,32 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     by_color["AvgPrice"] = np.where(by_color["SqFt"] != 0,
                                     by_color["Revenue"] / by_color["SqFt"], np.nan)
 
+    # "Other" is not a material -- it is every SKU that IS in the Products master but
+    # whose Catalogs field is blank, so no material type could be read off it. In
+    # practice those are labor / edge / cutout / removal / service lines. Break the
+    # bucket out by SKU, and again line by line with the order it was billed on, so
+    # it can be identified and traced back instead of sitting there as one lump.
+    oth = sbs_m[sbs_m["Material"] == "Other"].copy()
+    oth["Description"] = oth["SKU"].map(sku2title).fillna("")
+    by_other = (oth.groupby(["SKU", "Description"], as_index=False)
+                .agg(Lines=("SKU", "size"), Quantity=("Quantity", "sum"),
+                     Revenue=("Extended", "sum"), Orders=("OrderID", "nunique"))
+                .sort_values("Revenue", ascending=False).reset_index(drop=True))
+    by_other["AvgPrice"] = np.where(by_other["Quantity"] != 0,
+                                    by_other["Revenue"] / by_other["Quantity"], np.nan)
+    oi = o.set_index("OrderID")
+    other_lines = pd.DataFrame({
+        "OrderID": oth["OrderID"].values,
+        "Order #": oth["OrderID"].map(oi["OrderNumber"]).values,
+        "Customer": oth["OrderID"].map(oi["Customer"]).values,
+        "Shop": oth["OrderID"].map(oi["Shop"]).values,
+        "Sales Person": oth["OrderID"].map(oi["Rep"]).values,
+        "SKU": oth["SKU"].values,
+        "Description": oth["Description"].values,
+        "Quantity": oth["Quantity"].values,
+        "Revenue": oth["Extended"].values,
+    }).sort_values(["Revenue", "OrderID"], ascending=[False, True]).reset_index(drop=True)
+
     by_ct = o.groupby("CustomerType", as_index=False).agg(
         Income=("Income", "sum"), Profit=("Profit", "sum"), Orders=("OrderID", "count"))
     by_ct = by_ct.sort_values("Income", ascending=False)
@@ -853,25 +1093,35 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     by_service_group = pd.DataFrame(
         [("Template", float(o["TemplateCost"].sum())),
          ("Install", float(o["InstallCost"].sum())),
-         ("Fabrication", float(o["FabricationCost"].sum()))],
+         ("Fabrication", float(o["FabricationCost"].sum())),
+         ("Plumbing", float(o["PlumbingCost"].sum())),
+         ("Additional", float(o["AdditionalCost"].sum()))],
         columns=["Group", "Amount"])
     by_service_group = (by_service_group[by_service_group["Amount"] != 0]
                         .sort_values("Amount", ascending=False).reset_index(drop=True))
 
+    # The $/sqft the install total pot works out to, and the sqft it is spread
+    # over — reported in the sidebar and the Operational tab.
+    _install_rate_meta = install_spread(o, cfg, o["InstallFromFile"].ne(0))
+
     op_diag = {}
-    for role, key, costcol in [("template_cost", "template", "TemplateCost"),
-                               ("install_cost", "install", "InstallCost"),
-                               ("fabrication_cost", "fabrication", "FabricationCost")]:
+    # srccol = the column holding what the FILE contributed (fabrication's rate
+    # fallback is reported separately, below, so the file diagnostics stay honest).
+    for role, key, srccol in [("template_cost", "template", "TemplateCost"),
+                              ("install_cost", "install", "InstallFromFile"),
+                              ("fabrication_cost", "fabrication", "FabFromLog"),
+                              ("additional_cost", "additional", "AdditionalFromFile")]:
         d = data[role]["diag"] if role in data else {}
         op_diag[key] = {
             "label": _OPCOST_SPECS[role]["label"],
             "loaded": role in data,
             "sheets": d.get("sheets", []),
+            "vendors": d.get("vendors", []),
             "rows": d.get("rows", 0),
             "orders_in_file": d.get("orders_in_file", 0),
             "total_in_file": d.get("total_in_file", 0.0),
-            "matched_orders": int((o[costcol] != 0).sum()),
-            "matched_total": float(o[costcol].sum()),
+            "matched_orders": int((o[srccol] != 0).sum()),
+            "matched_total": float(o[srccol].sum()),
         }
     has_opcost = any(v["loaded"] for v in op_diag.values())
 
@@ -879,6 +1129,8 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
         "period": period or "All periods",
         "income_basis": cfg.income_basis,
         "overhead_rate": cfg.overhead_rate,
+        "fab_rate": cfg.fab_rate,
+        "install_total": cfg.install_total,
         "n_orders": len(o),
         "has_allocations": "allocations" in data,
         "alloc_rows": al_rows,
@@ -897,11 +1149,23 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
         "has_opcost": has_opcost,
         "op_diag": op_diag,
         "op_total": float(o["OperationalCost"].sum()),
+        "fab_log_total": float(o["FabFromLog"].sum()),
+        "fab_rate_orders": int(((o["FabFromLog"] == 0) & (o["FabricationCost"] != 0)).sum()),
+        "fab_rate_total": float(o.loc[o["FabFromLog"] == 0, "FabricationCost"].sum()),
+        "install_file_total": float(o["InstallFromFile"].sum()),
+        "install_rate": _install_rate_meta[0],
+        "install_rate_sqft": _install_rate_meta[1],
+        "install_rate_orders": int(((o["InstallFromFile"] == 0)
+                                    & (o["InstallCost"] != 0)).sum()),
+        "install_rate_total": float(o.loc[o["InstallFromFile"] == 0, "InstallCost"].sum()),
+        "install_uncovered_orders": int((o["InstallFromFile"] == 0).sum()),
+        "additional_file_total": float(o["AdditionalFromFile"].sum()),
         "has_manager_map": bool(cfg.manager_map),
         "income_total": float(o["Income"].sum()),
         "profit_total": float(o["Profit"].sum()),
     }
-    return Report(o, rep_detail, by_material, by_color, by_ct, by_service_group, periods, meta)
+    return Report(o, rep_detail, by_material, by_color, by_other, other_lines,
+                  by_ct, by_service_group, periods, meta)
 
 
 def build_summary(rep_detail: pd.DataFrame, group_col: str) -> pd.DataFrame:

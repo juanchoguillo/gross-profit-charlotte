@@ -11,8 +11,6 @@ exmaple_files/
 *.csv
 *.xlsx
 *.xlsb
+*.numbers
 config.json
 order_overrides.json
-
-# Allow the (non-sensitive) mapping template back in
-!shop_manager_mapping_template.xlsx

@@ -18,8 +18,8 @@ from report_xlsx import COVER_SHEET, build_full_export, build_report_excel
 st.set_page_config(page_title="MC Granite — Gross Profit", layout="wide", page_icon="📊")
 PALETTE = ["#1f4e79", "#2e75b6", "#9dc3e6", "#c55a11", "#ed7d31", "#70ad47", "#a6a6a6", "#7030a0"]
 
-_LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "assets", "LOGO-MC-GRANITE.png")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOGO = os.path.join(_HERE, "assets", "LOGO-MC-GRANITE.png")
 if os.path.exists(_LOGO):
     st.logo(_LOGO, size="large")
 
@@ -35,14 +35,11 @@ st.markdown(
 )
 
 # --------------------------------------------------------------------------
-# Login — static users, dropdown + PIN. shop=None ⇒ admin (sees/edits all);
-# otherwise the whole dashboard is scoped to that user's shop.
+# Login — single admin account, username + password. shop=None ⇒ admin
+# (sees/edits all); a user with a shop would be scoped to that shop.
 # --------------------------------------------------------------------------
 USERS = {
-    "maria":   {"pin": "1024", "shop": None},
-    "carlos":  {"pin": "1021", "shop": "Jasper"},
-    "manuel":  {"pin": "1022", "shop": "Blue Ridge"},
-    "luciano": {"pin": "1023", "shop": "Kennesaw"},
+    "admin": {"pin": "123456", "shop": None},
 }
 
 if "auth_user" not in st.session_state:
@@ -53,16 +50,17 @@ if "auth_user" not in st.session_state:
         st.title("🔐 Gross Profit")
         st.caption("MC Granite — sign in to continue")
         with st.form("login"):
-            login_user = st.selectbox("User", list(USERS), format_func=str.title)
-            login_pin = st.text_input("PIN", type="password", max_chars=8,
-                                      placeholder="4-digit PIN")
+            login_user = st.text_input("User", placeholder="admin")
+            login_pin = st.text_input("Password", type="password",
+                                      placeholder="Password")
             submitted = st.form_submit_button("Sign in", type="primary")
         if submitted:
-            if login_pin.strip() == USERS[login_user]["pin"]:
-                st.session_state["auth_user"] = login_user
+            account = USERS.get(login_user.strip().lower())
+            if account and login_pin.strip() == account["pin"]:
+                st.session_state["auth_user"] = login_user.strip().lower()
                 st.rerun()
             else:
-                st.error("Wrong PIN — try again.")
+                st.error("Wrong user or password — try again.")
     st.stop()
 
 AUTH_USER = st.session_state["auth_user"]
@@ -89,22 +87,24 @@ NET_MARGIN_COLS = [
     ("SqFtBilled", "Sq Ft (Stone)"), ("SqFtAllocated", "Sq Ft Allocated"),
     ("TotalInvoice", "Total Invoice"), ("SalesTax", "Sales Tax"), ("NetSales", "Net Sales"),
     ("TemplateCost", "Template Cost"), ("InstallCost", "Install Cost"),
-    ("FabricationCost", "Fab Cost"), ("MaterialCost", "Material Cost"),
+    ("FabricationCost", "Fab Cost"), ("PlumbingCost", "Plumbing Cost"),
+    ("AdditionalCost", "Additional Costs"), ("MaterialCost", "Material Cost"),
     ("DirectCost", "Total Direct Cost"), ("GrossProfit", "Gross Profit ($)"),
     ("GPMargin", "GP Margin %"), ("FixedCost", "Fixed Cost"),
     ("NetProfit", "Net Profit ($)"), ("NetMargin", "Net Margin %"),
     ("Contribution", "Contribution / Sq Ft"),
 ]
 NM_MONEY = ["TotalInvoice", "SalesTax", "NetSales", "TemplateCost", "InstallCost",
-            "FabricationCost", "MaterialCost", "DirectCost", "GrossProfit",
-            "FixedCost", "NetProfit", "Contribution"]
+            "FabricationCost", "PlumbingCost", "AdditionalCost", "MaterialCost",
+            "DirectCost", "GrossProfit", "FixedCost", "NetProfit", "Contribution"]
 NM_SQFT = ["SqFtBilled", "SqFtAllocated"]
 NM_PCT = ["GPMargin", "NetMargin"]
 
 
 def build_net_margin(df: pd.DataFrame) -> pd.DataFrame:
     """Add the Net-Margin derived columns to a per-order frame.
-    Direct cost = material + template + install + fab; Gross Profit = Net Sales −
+    Direct cost = material + template + install + fab + plumbing + additional;
+    Gross Profit = Net Sales −
     Direct; Fixed Cost = stone sqft × the fixed-cost rate (the app's Overhead
     column); Net Profit = Gross − Fixed."""
     nm = df.copy()
@@ -121,14 +121,14 @@ def build_net_margin(df: pd.DataFrame) -> pd.DataFrame:
 
 def op_diag_table(od: dict) -> pd.DataFrame:
     """The Operational tab's per-file diagnostics, one row per cost type plus a
-    TOTAL row. Totals only — individual crew tabs are counted, not listed."""
+    TOTAL row. Totals only — individual tabs are counted, not listed."""
     rows = []
-    for key in ["template", "install", "fabrication"]:
+    for key in ["template", "install", "fabrication", "additional"]:
         v = od[key]
         rows.append({
             "Type": v["label"],
             "Loaded": "✅" if v["loaded"] else "—",
-            "Crew tabs": len(v["sheets"]),
+            "Tabs read": len(v["sheets"]),
             "Orders in file": v["orders_in_file"],
             "Cost in file": v["total_in_file"],
             "Orders matched": v["matched_orders"],
@@ -136,7 +136,7 @@ def op_diag_table(od: dict) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     total = {c: df[c].sum() for c in
-             ["Crew tabs", "Orders in file", "Cost in file",
+             ["Tabs read", "Orders in file", "Cost in file",
               "Orders matched", "Cost applied (period)"]}
     total.update({"Type": "TOTAL", "Loaded": ""})
     return pd.concat([df, pd.DataFrame([total])], ignore_index=True)
@@ -336,11 +336,12 @@ if source == "Saved report":
 if source == "Upload files":
     ups = st.sidebar.file_uploader(
         "Drop your export files",
-        type=["csv", "xlsx", "xlsm", "xls", "xlsb"],
+        type=["csv", "xlsx", "xlsm", "xls", "xlsb", "numbers"],
         accept_multiple_files=True,
         help="Sales By SKU · Invoice List · Inventory Allocation · Sales Person Summary · "
         "Customer (ReportAdHoc) · Products · Template Schedule · Install Schedule (.xlsb) · "
-        "Production LOG (operational cost) · and optionally a rep→shop→manager mapping file.",
+        "Production LOG (operational cost) · vendor bill exports (additional cost) · "
+        "and optionally a rep→shop→manager mapping file.",
     )
     if ups:
         blobs = tuple((u.name, u.getvalue()) for u in ups)
@@ -363,6 +364,7 @@ OPTIONAL = {
     "template_cost": "Template Schedule (template cost)",
     "install_cost": "Install Schedule (install cost)",
     "fabrication_cost": "Production LOG (fabrication cost)",
+    "additional_cost": "Vendor bills (additional cost)",
     "rep_map": "Shop/Manager mapping",
 }
 
@@ -404,6 +406,27 @@ st.sidebar.subheader("Settings")
 
 basis_label = st.sidebar.radio("Income basis", ["Billed (Total − Credit Memo − Tax)", "Amount Paid"], index=0)
 income_basis = "paid" if basis_label == "Amount Paid" else "billed"
+fab_rate = st.sidebar.number_input(
+    "Fab fixed cost $/SqFt (stone)", value=0.00, min_value=0.00, step=0.01,
+    format="%.2f",
+    help="Fills the **Fab Cost** column from stone sqft: Fab Cost = Sq Ft (Stone) × "
+    "this rate. Orders that already have a cost in the Production LOG keep the "
+    "LOG amount — the rate only fills the rest. It is a direct cost, so it "
+    "reduces Gross Profit.")
+if fab_rate > 0:
+    st.sidebar.caption(f"Fab Cost = Sq Ft (Stone) × ${fab_rate:,.2f} on every order "
+                       "with no Production LOG cost.")
+install_total = st.sidebar.number_input(
+    "Install total cost $ (spread by SqFt)", value=0.00, min_value=0.00,
+    step=100.00, format="%.2f",
+    help="A **total** install bill for the period, not a rate. It is divided by "
+    "the stone sqft of the orders the Install Schedule doesn't cover, and the "
+    "resulting $/SqFt fills their **Install Cost**. Orders that already have a "
+    "schedule (or hand-typed) install cost keep it and are left out of the "
+    "split. It is a direct cost, so it reduces Gross Profit.")
+# The derived $/SqFt only exists once the period's orders are known — filled in
+# right after compute() below.
+install_note = st.sidebar.empty()
 overhead_rate = st.sidebar.number_input(
     "Fixed cost $/SqFt (stone)", value=0.00, min_value=0.00, step=0.01, format="%.2f",
     help="Enter your fixed-cost allocation per stone sqft — nothing is applied "
@@ -413,37 +436,71 @@ if overhead_rate == 0:
     st.sidebar.caption("⚠️ Fixed cost rate is 0 — Net Profit = Gross Profit. "
                        "Enter a $/SqFt rate above to allocate fixed costs.")
 
-# ---- Shop / Manager mapping: persisted + editable in-app -------------------
-# Discover every rep that appears in the data, plus saved + default + uploaded.
-disc_reps = set()
-if "sales_person" in data:
-    disc_reps |= {r for r in data["sales_person"]["SalesPersonName"].dropna().astype(str).str.strip()
-                  if r and r.lower() not in ("nan", "none")}
+# ---- Shop / Manager mapping: from the mapping file, editable in-app ---------
+# The template that sits next to app.py is loaded automatically, so the shops
+# are there without having to upload it every time. A mapping file supplied
+# with the data still wins.
+MAP_TEMPLATE = next(
+    (os.path.join(_HERE, f"shop_manager_mapping_template{ext}")
+     for ext in (".numbers", ".xlsx", ".xlsm", ".csv")
+     if os.path.isfile(os.path.join(_HERE, f"shop_manager_mapping_template{ext}"))),
+    None,
+)
+
+
+@st.cache_data(show_spinner=False)
+def _load_map_template(path: str, mtime: float):
+    """Cached on the file's mtime, so edits to the template are picked up."""
+    return gp.load_rep_map_file(path)
+
+
 saved_map = gp.load_mapping()
 file_map = {}
+map_source = None
 if "rep_map" in data:
     sm, mm = gp.parse_rep_map(data["rep_map"])
-    for r in set(sm) | set(mm):
-        file_map[r] = {"shop": sm.get(r, ""), "manager": mm.get(r, "")}
+    map_source = "the mapping file you loaded"
+elif MAP_TEMPLATE:
+    sm, mm = _load_map_template(MAP_TEMPLATE, os.path.getmtime(MAP_TEMPLATE))
+    map_source = os.path.basename(MAP_TEMPLATE)
+else:
+    sm, mm = {}, {}
+for r in set(sm) | set(mm):
+    file_map[r] = {"shop": sm.get(r, ""), "manager": mm.get(r, "")}
 
-all_reps = sorted(disc_reps | set(saved_map) | set(gp.DEFAULT_SHOP_MAP) | set(file_map))
+# The mapping file is the only source of reps and shops — nothing is hardcoded.
+# Rows added by hand in the Shops & Managers tab (or previously saved) are kept
+# alongside it, so a rep missing from the file can still be assigned in-app.
+HAS_MAP_FILE = bool(file_map)
+manual_reps = st.session_state.setdefault("manual_reps", set())
+all_reps = sorted(set(file_map) | set(saved_map) | manual_reps)
+
+
+def _seed_rep(r: str) -> dict:
+    """Starting shop/manager for a rep — the file wins once one is loaded."""
+    if HAS_MAP_FILE:
+        return {"shop": file_map.get(r, {}).get("shop") or saved_map.get(r, {}).get("shop", ""),
+                "manager": file_map.get(r, {}).get("manager")
+                           or saved_map.get(r, {}).get("manager", "")}
+    return {"shop": saved_map.get(r, {}).get("shop", ""),
+            "manager": saved_map.get(r, {}).get("manager", "")}
+
+
 if "mapping" not in st.session_state:
     st.session_state["mapping"] = {}
 mp = st.session_state["mapping"]
+for r in [r for r in mp if r not in all_reps]:   # drop reps no longer listed anywhere
+    del mp[r]
 for r in all_reps:                       # add any rep not yet in the working map
     if r not in mp:
-        mp[r] = {
-            "shop": saved_map.get(r, {}).get("shop") or file_map.get(r, {}).get("shop")
-                    or gp.DEFAULT_SHOP_MAP.get(r, ""),
-            "manager": saved_map.get(r, {}).get("manager") or file_map.get(r, {}).get("manager")
-                       or gp.DEFAULT_MANAGER_MAP.get(r, ""),
-        }
+        mp[r] = _seed_rep(r)
 
 shop_map = {r: v["shop"] for r, v in mp.items() if v.get("shop")}
 manager_map = {r: v["manager"] for r, v in mp.items() if v.get("manager")}
 
 cfg = gp.Config(shop_map=shop_map, manager_map=manager_map,
-                overhead_rate=overhead_rate, income_basis=income_basis)
+                overhead_rate=overhead_rate, fab_rate=fab_rate,
+                install_total=install_total, income_basis=income_basis)
 
 probe = gp.compute(data, cfg, period=None)
 period_opts = ["All periods"] + probe.periods
@@ -458,6 +515,26 @@ rep = gp.compute(data, cfg, period=period)
 # Saved in-app order edits overlay the computed numbers, for every user.
 overrides = gp.load_order_overrides()
 orders_all = gp.apply_order_overrides(rep.orders, overrides, cfg)
+# The $/SqFt the install total actually works out to once hand-typed install
+# costs are out of the split — what the captions and the Excel cover report.
+_inst_manual = gp.install_manual_mask(orders_all, overrides)
+_inst_covered = orders_all["InstallFromFile"].ne(0) | _inst_manual
+install_rate, install_sqft = gp.install_spread(orders_all, cfg, _inst_covered)
+# What the split actually put on the orders the Install Schedule doesn't cover,
+# company-wide — the shop filter below narrows `orders_all`, these must not move.
+install_split_orders = int((~_inst_covered & orders_all["InstallCost"].ne(0)).sum())
+install_split_total = float(orders_all.loc[~_inst_covered, "InstallCost"].sum())
+install_file_total = float(orders_all["InstallFromFile"].sum())
+
+if install_total > 0:
+    if install_rate > 0:
+        install_note.caption(
+            f"${install_total:,.2f} ÷ {install_sqft:,.2f} sqft = "
+            f"**${install_rate:,.2f}/SqFt** on {install_split_orders:,} order(s) "
+            f"with no install cost (period {rep.meta['period']}).")
+    else:
+        install_note.caption("⚠️ Every order already has an install cost (or none "
+                             "has stone sqft) — nothing to spread this total over.")
 rd = rep.rep_detail
 if not IS_ADMIN:                 # shop users only ever see their own shop
     _shop_lc = USER_SHOP.lower()
@@ -517,11 +594,17 @@ k[5].metric("SqFt Billed", f"{fo['SqFtBilled'].sum():,.2f}")
 
 # Data-quality banners — company-wide diagnostics, admin only.
 op_diag = rep.meta["op_diag"]
+# Operational cost can come from the schedule files, the fab $/SqFt rate or
+# hand-typed plumbing — the tab and its banners follow whichever produced a number.
+has_op_amount = bool(rep.meta["has_opcost"]) or float(fo["OperationalCost"].sum()) != 0
 if IS_ADMIN:
-    if not rep.meta["has_opcost"]:
-        st.info("ℹ️ No operational-cost files loaded → Operational Cost is $0. Add the "
-                "**Template Schedule**, **Install Schedule** (.xlsb) and **Production LOG** to "
-                "capture template / installation / fabrication cost.")
+    if not has_op_amount:
+        st.info("ℹ️ No operational cost yet → Operational Cost is $0. Add the "
+                "**Template Schedule**, **Install Schedule** (.xlsb), **Production LOG** and "
+                "**vendor bill exports** to capture template / installation / "
+                "fabrication / additional cost — or set a **Fab fixed cost $/SqFt** "
+                "or an **Install total cost $** in the sidebar and type plumbing / "
+                "additional cost per order in the **Orders** tab.")
     else:
         unmatched = [v["label"] for v in op_diag.values()
                      if v["loaded"] and v["matched_orders"] == 0]
@@ -571,6 +654,19 @@ ct_table = fo.groupby("CustomerType", as_index=False).agg(
     Income=("Income", "sum"), Profit=("Profit", "sum"), Orders=("OrderID", "count")
 ).sort_values("Income", ascending=False)
 
+# Operational cost by type, over the same filtered + edited orders. Built here
+# rather than taken off the Report, because plumbing cost (and any hand-edited
+# operational cost) only exists once the saved order overrides are applied.
+sg_table = pd.DataFrame(
+    [("Template", float(fo["TemplateCost"].sum())),
+     ("Install", float(fo["InstallCost"].sum())),
+     ("Fabrication", float(fo["FabricationCost"].sum())),
+     ("Plumbing", float(fo["PlumbingCost"].sum())),
+     ("Additional", float(fo["AdditionalCost"].sum()))],
+    columns=["Group", "Amount"])
+sg_table = (sg_table[sg_table["Amount"] != 0]
+            .sort_values("Amount", ascending=False).reset_index(drop=True))
+
 # One canonical per-order export frame — the original workbook's
 # "Orders — Net Margin" layout over ALL sidebar-scoped orders. Both Excel
 # downloads use this full list; the Orders tab's quick filters (order #, rep,
@@ -594,13 +690,14 @@ else:
 
 LABELS = {"SqFtBilled": "SqFt Billed", "SqFtAllocated": "SqFt Alloc.", "Income": "Income",
           "MaterialCost": "Material", "TemplateCost": "Template", "InstallCost": "Install",
-          "FabricationCost": "Fabrication", "OperationalCost": "Operational",
+          "FabricationCost": "Fabrication", "PlumbingCost": "Plumbing",
+          "AdditionalCost": "Additional", "OperationalCost": "Operational",
           "Overhead": "Overhead", "TotalCost": "Total Cost", "Profit": "Profit",
           "Margin": "Margin"}
 # Same columns, same order, as the exported Summary sheet.
 SHOWN = ["SqFtBilled", "SqFtAllocated", "Income", "MaterialCost", "TemplateCost",
-         "InstallCost", "FabricationCost", "OperationalCost", "Overhead",
-         "TotalCost", "Profit", "Margin"]
+         "InstallCost", "FabricationCost", "PlumbingCost", "AdditionalCost",
+         "OperationalCost", "Overhead", "TotalCost", "Profit", "Margin"]
 
 
 def style_summary(df: pd.DataFrame):
@@ -608,6 +705,7 @@ def style_summary(df: pd.DataFrame):
     fmt = {"SqFt Billed": "{:,.2f}", "SqFt Alloc.": "{:,.2f}"}
     fmt.update({LABELS[c]: "${:,.2f}" for c in ["Income", "MaterialCost", "TemplateCost",
                                                 "InstallCost", "FabricationCost",
+                                                "PlumbingCost", "AdditionalCost",
                                                 "OperationalCost", "Overhead",
                                                 "TotalCost", "Profit"]})
     fmt["Margin"] = "{:.2%}"
@@ -635,8 +733,9 @@ with tab_summary:
             rep.by_material.rename(columns={"AvgPrice": "Avg $/unit"})
             if IS_ADMIN else pd.DataFrame(),
             ct_table,
-            rep.by_service_group if IS_ADMIN else pd.DataFrame(),
-            group_by, fixed_rate=overhead_rate, income_basis=income_basis,
+            sg_table if IS_ADMIN else pd.DataFrame(),
+            group_by, fixed_rate=overhead_rate, fab_rate=fab_rate,
+            install_rate=install_rate, income_basis=income_basis,
             period=rep.meta["period"], basis_label=basis_label)
         st.download_button("⬇️ Download report (Excel)", data=report_xlsx,
                            file_name=f"Gross Profit {rep.meta['period']} by {group_by}.xlsx",
@@ -686,9 +785,10 @@ with tab_orders:
         edit_mode = st.toggle(
             "✏️ **Edit mode** — type new values directly in the table",
             key="orders_edit_mode",
-            help="Editable: Total Invoice, Sales Tax, the two Sq Ft columns and the four "
-                 "direct costs. Net Sales, Gross Profit, Net Profit and the margins "
-                 "recompute when you Save."
+            help="Editable: Total Invoice, Sales Tax, the two Sq Ft columns and the six "
+                 "direct costs (Material, Template, Install, Fab, Plumbing, Additional). "
+                 "Net Sales, Gross Profit, Net Profit and the margins recompute when you "
+                 "Save."
                  + ("" if IS_ADMIN else f" You can edit {USER_SHOP} orders only."))
 
         if edit_mode:
@@ -795,7 +895,12 @@ with tab_orders:
         m = rep.meta
         st.caption(
             f"{len(ordr):,} orders · Net Sales = Total Invoice − Sales Tax (− credit memos) · "
-            f"Fixed Cost = Sq Ft (Stone) × **${overhead_rate:,.2f}** · "
+            + (f"Fab Cost = Sq Ft (Stone) × **${fab_rate:,.2f}** where the Production LOG "
+               f"has no amount · " if fab_rate > 0 else "")
+            + (f"Install Cost = Sq Ft (Stone) × **${install_rate:,.2f}** "
+               f"(${install_total:,.2f} spread) where the Install Schedule has no "
+               f"amount · " if install_rate > 0 else "")
+            + f"Fixed Cost = Sq Ft (Stone) × **${overhead_rate:,.2f}** · "
             f"Net Profit = Gross Profit − Fixed Cost. "
             f"**Sq Ft (Stone) counts stone slab lines only** "
             f"({m['sqft_stone_total']:,.2f} stone sqft kept, "
@@ -816,12 +921,16 @@ with tab_orders:
             rep.by_color.rename(columns={"AvgPrice": "Avg $/SqFt"})
             if IS_ADMIN else pd.DataFrame(),
             ct_table,
-            rep.by_service_group if IS_ADMIN else pd.DataFrame(),
+            sg_table if IS_ADMIN else pd.DataFrame(),
             op_diag_table(rep.meta["op_diag"])
             if (IS_ADMIN and rep.meta["has_opcost"]) else None,
             mapping_df, group_by,
-            fixed_rate=overhead_rate, income_basis=income_basis,
-            period=rep.meta["period"], basis_label=basis_label)
+            fixed_rate=overhead_rate, fab_rate=fab_rate,
+            install_rate=install_rate, income_basis=income_basis,
+            period=rep.meta["period"], basis_label=basis_label,
+            by_other=rep.by_other.rename(columns={"AvgPrice": "Avg $/unit"})
+            if IS_ADMIN else None,
+            other_lines=rep.other_lines if IS_ADMIN else None)
         st.download_button(
             "⬇️ Download full report (Excel) — one sheet per tab", data=full_xlsx,
             file_name=f"Gross Profit Full Report {rep.meta['period']} by {group_by}.xlsx",
@@ -834,7 +943,8 @@ with tab_orders:
                 "**Orders — Net Margin** or **Order Detail** sheet) in Excel, then "
                 "upload it back here. Only these columns are read: **Total Invoice, "
                 "Sales Tax, Sq Ft (Stone), Sq Ft Allocated, Material / Template / "
-                "Install / Fab Cost** — every other column (Net Sales, Gross Profit, "
+                "Install / Fab / Plumbing Cost and Additional Costs** — every other "
+                "column (Net Sales, Gross Profit, "
                 "the margins) is recomputed. A cell set back to its original value "
                 "clears that edit. Other sheets are ignored and the source export "
                 "files are never modified."
@@ -975,11 +1085,14 @@ with tab_drill:
                 od = fo[fo["Rep"] == prow["Rep"]][
                     ["OrderID", "Customer", "CustomerType", "SqFtBilled", "Income",
                      "MaterialCost", "TemplateCost", "InstallCost", "FabricationCost",
-                     "OperationalCost", "Profit"]].sort_values("Income", ascending=False)
+                     "PlumbingCost", "AdditionalCost",
+                     "OperationalCost", "Profit"]].sort_values(
+                    "Income", ascending=False)
                 st.dataframe(od.style.format({
                     "SqFtBilled": "{:,.2f}", "Income": "${:,.2f}", "MaterialCost": "${:,.2f}",
                     "TemplateCost": "${:,.2f}", "InstallCost": "${:,.2f}",
-                    "FabricationCost": "${:,.2f}", "OperationalCost": "${:,.2f}",
+                    "FabricationCost": "${:,.2f}", "PlumbingCost": "${:,.2f}",
+                    "AdditionalCost": "${:,.2f}", "OperationalCost": "${:,.2f}",
                     "Profit": "${:,.2f}"}),
                     width="stretch", hide_index=True)
 
@@ -1032,6 +1145,59 @@ if IS_ADMIN:
                    "report — they restate each job's total next to the itemised lines "
                    "and would double-count revenue.")
 
+        # ---- What is actually inside the "Other" bucket ---------------------
+        st.divider()
+        st.subheader("What's inside “Other”")
+        st.caption("**Other** is not a stone — it is every SKU that exists in the Products "
+                   "master with a **blank Catalogs** field, so no material type could be "
+                   "read off it. In practice these are labor, edge, cutout, removal and "
+                   "service lines. Fill in `Catalogs` for these SKUs in the ERP and they "
+                   "move out of *Other* on the next export.")
+        bo = rep.by_other
+        if len(bo):
+            ol = rep.other_lines
+            oth_rev = float(bo["Revenue"].sum())
+            all_rev = float(bm["Revenue"].sum()) if len(bm) else 0.0
+            ko = st.columns(4)
+            ko[0].metric("“Other” revenue", money(oth_rev))
+            ko[1].metric("Share of this tab",
+                         f"{(oth_rev / all_rev * 100) if all_rev else 0:,.1f}%")
+            ko[2].metric("Distinct SKUs", f"{len(bo):,}")
+            ko[3].metric("Orders touched", f"{ol['OrderID'].nunique():,}")
+
+            bot = bo.rename(columns={"AvgPrice": "Avg $/unit"})
+            st.dataframe(bot.style.format({"Quantity": "{:,.2f}", "Revenue": "${:,.2f}",
+                                           "Avg $/unit": "${:,.2f}"}),
+                         width="stretch", hide_index=True,
+                         height=min(60 + 35 * len(bot), TABLE_H))
+            zero_lines = int((ol["Revenue"] == 0).sum())
+            st.caption(
+                f"{len(ol):,} lines across {len(bo):,} SKUs. "
+                "**Quantity mixes units** — sqft on the per-sqft SKUs (removals, "
+                "waterfall, honed/leathered finishes), piece counts on the rest — so "
+                "read *Avg $/unit* per row, never down the column."
+                + (f" {zero_lines:,} lines are billed at $0 (edges included in the slab "
+                   "price): they add Quantity but no revenue." if zero_lines else ""))
+
+            with st.expander("🔎 Locate them — every “Other” line and the order it sits on"):
+                picks = st.multiselect(
+                    "Filter by SKU", options=list(bo["SKU"]), default=[],
+                    help="Leave empty to list every line.")
+                od = ol[ol["SKU"].isin(picks)] if picks else ol
+                st.dataframe(
+                    od.drop(columns=["OrderID"]).style.format(
+                        {"Quantity": "{:,.2f}", "Revenue": "${:,.2f}"}),
+                    width="stretch", hide_index=True,
+                    height=min(60 + 35 * len(od), TABLE_H))
+                st.caption(f"{len(od):,} of {len(ol):,} lines · "
+                           f"{money(float(od['Revenue'].sum()))} · "
+                           f"{od['OrderID'].nunique():,} orders. "
+                           "The full list is in the Excel export "
+                           "(**Other Breakdown** and **Other — Detail** sheets).")
+        else:
+            st.info("No uncategorised (**Other**) lines this period — every SKU sold "
+                    "carries a Catalogs value.")
+
 with tab_ct:
     ct = ct_table
     if len(ct):
@@ -1052,19 +1218,43 @@ with tab_ct:
 if IS_ADMIN:
     with tab_op:
         od = rep.meta["op_diag"]
-        if not rep.meta["has_opcost"]:
-            st.info("No operational-cost files loaded. Add the **Template Schedule**, "
-                    "**Install Schedule** (.xlsb) and **Production LOG** to capture "
-                    "template / installation / fabrication cost per order. Cost attaches to an "
+        if not has_op_amount:
+            st.info("No operational cost yet. Add the **Template Schedule**, "
+                    "**Install Schedule** (.xlsb), **Production LOG** and **vendor bill "
+                    "exports** to capture template / installation / fabrication / "
+                    "additional cost per order — or set a **Fab fixed cost $/SqFt** or an "
+                    "**Install total cost $** in the sidebar and type plumbing / "
+                    "additional cost per order in the **Orders** tab. File-based cost attaches to an "
                     "order when it is invoiced in the selected period.")
         else:
             st.subheader("Operational cost by type")
-            if len(rep.by_service_group):
-                fig = px.bar(rep.by_service_group, x="Group", y="Amount", color="Group",
+            if len(sg_table):
+                fig = px.bar(sg_table, x="Group", y="Amount", color="Group",
                              color_discrete_sequence=PALETTE,
                              title="Operational cost applied this period")
                 fig.update_layout(showlegend=False, height=360)
                 st.plotly_chart(fig, width="stretch")
+
+            m = rep.meta
+            if m["fab_rate"] > 0:
+                st.caption(
+                    f"🧮 **Fab fixed cost** ${m['fab_rate']:,.2f}/sqft filled the Fab Cost "
+                    f"column on **{m['fab_rate_orders']:,}** order(s) with no Production LOG "
+                    f"amount — ${m['fab_rate_total']:,.2f} company-wide this period "
+                    f"(the LOG itself supplied ${m['fab_log_total']:,.2f}).")
+            if install_total > 0:
+                st.caption(
+                    f"🧮 **Install total cost** ${install_total:,.2f} ÷ "
+                    f"{install_sqft:,.2f} stone sqft = **${install_rate:,.2f}/sqft**, "
+                    f"filling the Install Cost column on **{install_split_orders:,}** "
+                    f"order(s) the Install Schedule doesn't cover — "
+                    f"${install_split_total:,.2f} company-wide this period (the "
+                    f"schedule itself supplied ${install_file_total:,.2f}).")
+            vend = m["op_diag"]["additional"].get("vendors") or []
+            if vend:
+                st.caption("🧾 **Additional cost** billed by " + ", ".join(f"**{v}**" for v in vend)
+                           + " — the order number is read out of each bill's Memo; a bill "
+                             "whose memo carries no order number is left out.")
 
             diag_df = op_diag_table(od)
 
@@ -1079,7 +1269,11 @@ if IS_ADMIN:
                 .apply(diag_rowstyle, axis=1),
                 width="stretch", hide_index=True)
             st.caption("One row per cost type — crew tabs are summed together, not "
-                       "broken out. **In file** = everything in the schedule workbook "
+                       "broken out. This table covers the **source files only**: "
+                       "fab cost derived from the $/SqFt rate, install cost derived from "
+                       "the install total, and hand-typed plumbing / additional cost are "
+                       "not in it. **In file** = everything in the "
+                       "source workbook "
                        "(all crew tabs, double-counting tabs excluded). **Applied (period)** "
                        "= only orders invoiced in the selected period — operational cost "
                        "attaches to an order when it is invoiced, the same way material "
@@ -1089,6 +1283,11 @@ if IS_ADMIN:
     with tab_map:
         st.caption("Assign each sales rep to a **Shop** and a **Manager**. Edits update the report "
                    "immediately; **Save** keeps them for next time. Add a row for any new rep.")
+        if map_source:
+            st.caption(f"📄 Reps and shops loaded from **{map_source}** ({len(file_map)} reps).")
+        else:
+            st.caption("⚠️ No mapping file found — add `shop_manager_mapping_template.numbers` "
+                       "next to the app, or load one with your data.")
         map_df = pd.DataFrame(
             [{"Sales Rep": r, "Shop": v.get("shop", ""), "Manager": v.get("manager", "")}
              for r, v in sorted(mp.items())]
@@ -1097,7 +1296,7 @@ if IS_ADMIN:
             map_df, key="map_editor", num_rows="dynamic", width="stretch", hide_index=True,
             column_config={
                 "Sales Rep": st.column_config.TextColumn("Sales Rep", required=True),
-                "Shop": st.column_config.TextColumn("Shop", help="e.g. Blue Ridge, Jasper, Kennesaw"),
+                "Shop": st.column_config.TextColumn("Shop", help="e.g. Charlotte, Hickory"),
                 "Manager": st.column_config.TextColumn("Manager"),
             },
         )
@@ -1110,8 +1309,9 @@ if IS_ADMIN:
                                     "manager": str(row.get("Manager") or "").strip()}
         # keep any discovered rep that a delete would otherwise drop
         for r in all_reps:
-            newmap.setdefault(r, {"shop": gp.DEFAULT_SHOP_MAP.get(r, ""),
-                                  "manager": gp.DEFAULT_MANAGER_MAP.get(r, "")})
+            newmap.setdefault(r, _seed_rep(r))
+        # Remember rows the user typed in, so they survive the next rerun's prune.
+        st.session_state["manual_reps"] = {r for r in newmap if r not in file_map}
         st.session_state["mapping"] = newmap
 
         c1, c2, _ = st.columns([1, 1, 3])
