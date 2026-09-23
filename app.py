@@ -368,6 +368,69 @@ OPTIONAL = {
     "rep_map": "Shop/Manager mapping",
 }
 
+# ---- Shop / Manager mapping: from the mapping file, editable in-app ---------
+# The template that sits next to app.py is loaded automatically, so the shops
+# are there without having to upload it every time. A mapping file supplied
+# with the data still wins.
+MAP_TEMPLATE = next(
+    (os.path.join(_HERE, f"shop_manager_mapping_template{ext}")
+     for ext in (".numbers", ".xlsx", ".xlsm", ".csv")
+     if os.path.isfile(os.path.join(_HERE, f"shop_manager_mapping_template{ext}"))),
+    None,
+)
+
+
+@st.cache_data(show_spinner=False)
+def _load_map_template(path: str, mtime: float):
+    """Cached on the file's mtime, so edits to the template are picked up."""
+    return gp.load_rep_map_file(path)
+
+
+
+def render_rep_shops() -> None:
+    """Pre-upload view: which sales rep belongs to which shop.
+
+    Uses the in-app edits from this session when there are any, otherwise the
+    mapping template next to the app (it wins, as in the report) and then the
+    mapping saved to config.json."""
+    reps = st.session_state.get("mapping")
+    src = "your edits in this session"
+    if not reps:
+        tsm, tmm = (_load_map_template(MAP_TEMPLATE, os.path.getmtime(MAP_TEMPLATE))
+                    if MAP_TEMPLATE else ({}, {}))
+        saved = gp.load_mapping()
+        reps = {}
+        for r in sorted(set(tsm) | set(tmm) | set(saved)):
+            reps[r] = {"shop": tsm.get(r) or saved.get(r, {}).get("shop", ""),
+                       "manager": tmm.get(r) or saved.get(r, {}).get("manager", "")}
+        src = " + ".join(filter(None, [
+            f"**{os.path.basename(MAP_TEMPLATE)}**" if MAP_TEMPLATE else None,
+            "**config.json** (saved edits)" if saved else None]))
+
+    st.subheader("👥 Sales reps by shop")
+    if not reps:
+        st.warning("No rep → shop mapping found — add `shop_manager_mapping_template.numbers` "
+                   "next to the app, or include a mapping file with your uploads.")
+        return
+    st.caption(f"From {src}. Check this before uploading — a mapping file uploaded with "
+               "the data replaces it, and it can be edited in the **Shops & Managers** tab.")
+
+    by_shop: dict = {}
+    for r, v in reps.items():
+        by_shop.setdefault(v.get("shop") or gp.UNASSIGNED, []).append((r, v.get("manager", "")))
+    if not IS_ADMIN:
+        by_shop = {k: v for k, v in by_shop.items() if k.lower() == USER_SHOP.lower()}
+    shops = sorted(by_shop, key=lambda k: (k == gp.UNASSIGNED, k.lower()))
+
+    cols = st.columns(min(len(shops), 3) or 1)
+    for i, shop in enumerate(shops):
+        members = sorted(by_shop[shop], key=lambda t: t[0].lower())
+        with cols[i % len(cols)].container(border=True):
+            icon = "⚠️" if shop == gp.UNASSIGNED else "🏪"
+            st.markdown(f"**{icon} {shop}** · {len(members)} rep{'s' * (len(members) != 1)}")
+            st.markdown("\n".join(f"- {r}" + (f" — _{m}_" if m else "") for r, m in members))
+
+
 if not blobs:
     st.title("Dynamic Gross Profit Report")
     st.info("👈 Load your export files to begin. The app recognises each file by its "
@@ -375,6 +438,8 @@ if not blobs:
     c = st.columns(2)
     c[0].markdown("**Required**\n\n" + "\n".join(f"- {v}" for v in REQUIRED.values()))
     c[1].markdown("**Optional**\n\n" + "\n".join(f"- {v}" for v in OPTIONAL.values()))
+    st.divider()
+    render_rep_shops()
     st.stop()
 
 data, notes = _load(blobs)
@@ -436,24 +501,7 @@ if overhead_rate == 0:
     st.sidebar.caption("⚠️ Fixed cost rate is 0 — Net Profit = Gross Profit. "
                        "Enter a $/SqFt rate above to allocate fixed costs.")
 
-# ---- Shop / Manager mapping: from the mapping file, editable in-app ---------
-# The template that sits next to app.py is loaded automatically, so the shops
-# are there without having to upload it every time. A mapping file supplied
-# with the data still wins.
-MAP_TEMPLATE = next(
-    (os.path.join(_HERE, f"shop_manager_mapping_template{ext}")
-     for ext in (".numbers", ".xlsx", ".xlsm", ".csv")
-     if os.path.isfile(os.path.join(_HERE, f"shop_manager_mapping_template{ext}"))),
-    None,
-)
-
-
-@st.cache_data(show_spinner=False)
-def _load_map_template(path: str, mtime: float):
-    """Cached on the file's mtime, so edits to the template are picked up."""
-    return gp.load_rep_map_file(path)
-
-
+# ---- Shop / Manager mapping (template + saved edits, see above) -----------
 saved_map = gp.load_mapping()
 file_map = {}
 map_source = None
