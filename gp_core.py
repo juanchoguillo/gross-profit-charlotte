@@ -287,6 +287,18 @@ UNASSIGNED = "(Unassigned)"
 UNKNOWN = "Unknown"
 
 
+def _rep_key(name) -> str:
+    """Loose rep-name key so "Cesar G. Lombera", "cesar g lombera" and
+    "Cesar  G Lombera" all hit the same mapping row."""
+    return re.sub(r"\s+", " ", str(name).replace(".", " ")).strip().casefold()
+
+
+def _map_rep(reps: pd.Series, mapping: dict) -> pd.Series:
+    """Map reps through a rep -> value dict, tolerant of case/spacing/periods."""
+    keyed = {_rep_key(k): str(v).strip() for k, v in mapping.items() if str(v).strip()}
+    return reps.map(lambda r: keyed.get(_rep_key(r)) if pd.notna(r) else None)
+
+
 @dataclass
 class Config:
     shop_map: dict = field(default_factory=dict)          # rep -> shop
@@ -981,8 +993,8 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     # ---- Per-order frame ----
     o = pd.DataFrame({"OrderID": sorted(month_orders)})
     o["Rep"] = o["OrderID"].map(attribute)
-    o["Shop"] = o["Rep"].map(cfg.shop_map).fillna(UNASSIGNED)
-    o["Manager"] = o["Rep"].map(cfg.manager_map).fillna(UNASSIGNED)
+    o["Shop"] = _map_rep(o["Rep"], cfg.shop_map).fillna(UNASSIGNED)
+    o["Manager"] = _map_rep(o["Rep"], cfg.manager_map).fillna(UNASSIGNED)
     o["OrderNumber"] = o["OrderID"].map(ordernum_by_order)
     o["RefNumber"] = o["OrderID"].map(refnum_by_order)
     o["CustomerNumber"] = o["OrderID"].map(cust_of)
