@@ -395,6 +395,7 @@ DEFAULT_REP_SHOPS = {
     "Viviana Cardona": "Charlotte",
     "Mark Sutton": "Charlotte",
     "Monica Saldana": "Charlotte",
+    "Krystal Hargett": "Charlotte",
     "Cesar G. Lombera": "Hickory",
     "Jessica Lawing": "Hickory",
 }
