@@ -387,33 +387,104 @@ def _load_map_template(path: str, mtime: float):
 
 
 
+# Built-in rep -> shop list, so the shops are there even where the template
+# isn't deployed (e.g. Streamlit Cloud — *.numbers files aren't in git).
+# The template, saved config.json and an uploaded mapping file all layer on top.
+DEFAULT_REP_SHOPS = {
+    "Spencer Matthews": "Charlotte",
+    "Viviana Cardona": "Charlotte",
+    "Mark Sutton": "Charlotte",
+    "Monica Saldana": "Charlotte",
+    "Cesar G. Lombera": "Hickory",
+    "Jessica Lawing": "Hickory",
+}
+
+
+def base_mapping(sm: dict | None = None, mm: dict | None = None) -> tuple[dict, list]:
+    """Rep -> {shop, manager} before any in-app edits, plus where it came from.
+
+    Layers, later wins: built-in defaults < config.json < mapping file (the one
+    uploaded with the data — sm/mm — else the template next to the app). Names
+    that differ only in case, spacing or periods merge into one row."""
+    sources, file_src = ["built-in list"], None
+    if sm is None and mm is None:
+        sm, mm = ({}, {})
+        if MAP_TEMPLATE:
+            sm, mm = _load_map_template(MAP_TEMPLATE, os.path.getmtime(MAP_TEMPLATE))
+            file_src = os.path.basename(MAP_TEMPLATE)
+    else:
+        file_src = "the mapping file you loaded"
+    saved = gp.load_mapping()
+    layers = [({r: {"shop": s_} for r, s_ in DEFAULT_REP_SHOPS.items()}, None),
+              (saved, "config.json (saved edits)"),
+              ({r: {"shop": sm.get(r, ""), "manager": mm.get(r, "")}
+                for r in set(sm) | set(mm)}, file_src if (sm or mm) else None)]
+    out, by_key = {}, {}
+    for layer, src in layers:
+        if layer and src:
+            sources.append(src)
+        for r, v in layer.items():
+            name = by_key.setdefault(gp._rep_key(r), r)
+            row = out.setdefault(name, {"shop": "", "manager": ""})
+            for f in ("shop", "manager"):
+                if str(v.get(f) or "").strip():
+                    row[f] = str(v[f]).strip()
+    return out, sources
+
+
+def working_mapping(base: dict) -> dict:
+    """The base map with this session's in-app edits (added/changed reps) on top."""
+    mp = {r: dict(v) for r, v in base.items()}
+    mp.update({r: dict(v) for r, v in st.session_state.get("rep_edits", {}).items()})
+    return mp
+
+
+def mapping_editor(base: dict, key: str) -> dict:
+    """Editable Sales Rep / Shop / Manager table. Added or changed rows are kept
+    as session edits (so they survive loading files); base reps can't be deleted.
+    Returns the updated working map."""
+    map_df = pd.DataFrame(
+        [{"Sales Rep": r, "Shop": v.get("shop", ""), "Manager": v.get("manager", "")}
+         for r, v in sorted(working_mapping(base).items(), key=lambda t: t[0].lower())],
+        columns=["Sales Rep", "Shop", "Manager"],
+    )
+    edited = st.data_editor(
+        map_df, key=key, num_rows="dynamic", width="stretch", hide_index=True,
+        column_config={
+            "Sales Rep": st.column_config.TextColumn("Sales Rep", required=True),
+            "Shop": st.column_config.TextColumn("Shop", help="e.g. Charlotte, Hickory"),
+            "Manager": st.column_config.TextColumn("Manager"),
+        },
+    )
+    newmap = {}
+    for _, row in edited.iterrows():
+        rep_name = str(row.get("Sales Rep") or "").strip()
+        if rep_name and rep_name.lower() not in ("nan", "none"):
+            newmap[rep_name] = {"shop": str(row.get("Shop") or "").strip(),
+                                "manager": str(row.get("Manager") or "").strip()}
+    for r, v in base.items():            # keep any base rep a delete would drop
+        newmap.setdefault(r, dict(v))
+    st.session_state["rep_edits"] = {r: v for r, v in newmap.items() if base.get(r) != v}
+
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("💾 Save mapping", type="primary", key=f"{key}_save"):
+        gp.save_mapping(newmap)
+        st.success(f"Saved {len(newmap)} reps to config.json")
+    n_mgr = sum(1 for v in newmap.values() if v.get("manager"))
+    n_shop = sum(1 for v in newmap.values() if v.get("shop"))
+    c2.metric("Mapped", f"{n_shop} shops · {n_mgr} mgrs")
+    return newmap
+
+
 def render_rep_shops() -> None:
-    """Pre-upload view: which sales rep belongs to which shop.
-
-    Uses the in-app edits from this session when there are any, otherwise the
-    mapping template next to the app (it wins, as in the report) and then the
-    mapping saved to config.json."""
-    reps = st.session_state.get("mapping")
-    src = "your edits in this session"
-    if not reps:
-        tsm, tmm = (_load_map_template(MAP_TEMPLATE, os.path.getmtime(MAP_TEMPLATE))
-                    if MAP_TEMPLATE else ({}, {}))
-        saved = gp.load_mapping()
-        reps = {}
-        for r in sorted(set(tsm) | set(tmm) | set(saved)):
-            reps[r] = {"shop": tsm.get(r) or saved.get(r, {}).get("shop", ""),
-                       "manager": tmm.get(r) or saved.get(r, {}).get("manager", "")}
-        src = " + ".join(filter(None, [
-            f"**{os.path.basename(MAP_TEMPLATE)}**" if MAP_TEMPLATE else None,
-            "**config.json** (saved edits)" if saved else None]))
-
+    """Pre-upload view: which sales rep belongs to which shop, editable."""
+    base, sources = base_mapping()
+    reps = working_mapping(base)
     st.subheader("👥 Sales reps by shop")
-    if not reps:
-        st.warning("No rep → shop mapping found — add `shop_manager_mapping_template.numbers` "
-                   "next to the app, or include a mapping file with your uploads.")
-        return
-    st.caption(f"From {src}. Check this before uploading — a mapping file uploaded with "
-               "the data replaces it, and it can be edited in the **Shops & Managers** tab.")
+    st.caption("From " + " + ".join(f"**{x}**" for x in sources)
+               + (" + your edits" if st.session_state.get("rep_edits") else "")
+               + ". Check this before uploading — a mapping file uploaded with the data "
+               "overrides it.")
 
     by_shop: dict = {}
     for r, v in reps.items():
@@ -429,6 +500,12 @@ def render_rep_shops() -> None:
             icon = "⚠️" if shop == gp.UNASSIGNED else "🏪"
             st.markdown(f"**{icon} {shop}** · {len(members)} rep{'s' * (len(members) != 1)}")
             st.markdown("\n".join(f"- {r}" + (f" — _{m}_" if m else "") for r, m in members))
+
+    if IS_ADMIN:
+        with st.expander("✏️ Add or change reps", expanded=False):
+            st.caption("Add a row for any new rep, or change a shop. Edits apply right away "
+                       "for this session; **Save** keeps them in config.json.")
+            mapping_editor(base, "landing_map_editor")
 
 
 if not blobs:
@@ -501,47 +578,12 @@ if overhead_rate == 0:
     st.sidebar.caption("⚠️ Fixed cost rate is 0 — Net Profit = Gross Profit. "
                        "Enter a $/SqFt rate above to allocate fixed costs.")
 
-# ---- Shop / Manager mapping (template + saved edits, see above) -----------
-saved_map = gp.load_mapping()
-file_map = {}
-map_source = None
+# ---- Shop / Manager mapping: defaults + template/config + uploaded file + edits
 if "rep_map" in data:
-    sm, mm = gp.parse_rep_map(data["rep_map"])
-    map_source = "the mapping file you loaded"
-elif MAP_TEMPLATE:
-    sm, mm = _load_map_template(MAP_TEMPLATE, os.path.getmtime(MAP_TEMPLATE))
-    map_source = os.path.basename(MAP_TEMPLATE)
+    base_map, map_sources = base_mapping(*gp.parse_rep_map(data["rep_map"]))
 else:
-    sm, mm = {}, {}
-for r in set(sm) | set(mm):
-    file_map[r] = {"shop": sm.get(r, ""), "manager": mm.get(r, "")}
-
-# The mapping file is the only source of reps and shops — nothing is hardcoded.
-# Rows added by hand in the Shops & Managers tab (or previously saved) are kept
-# alongside it, so a rep missing from the file can still be assigned in-app.
-HAS_MAP_FILE = bool(file_map)
-manual_reps = st.session_state.setdefault("manual_reps", set())
-all_reps = sorted(set(file_map) | set(saved_map) | manual_reps)
-
-
-def _seed_rep(r: str) -> dict:
-    """Starting shop/manager for a rep — the file wins once one is loaded."""
-    if HAS_MAP_FILE:
-        return {"shop": file_map.get(r, {}).get("shop") or saved_map.get(r, {}).get("shop", ""),
-                "manager": file_map.get(r, {}).get("manager")
-                           or saved_map.get(r, {}).get("manager", "")}
-    return {"shop": saved_map.get(r, {}).get("shop", ""),
-            "manager": saved_map.get(r, {}).get("manager", "")}
-
-
-if "mapping" not in st.session_state:
-    st.session_state["mapping"] = {}
-mp = st.session_state["mapping"]
-for r in [r for r in mp if r not in all_reps]:   # drop reps no longer listed anywhere
-    del mp[r]
-for r in all_reps:                       # add any rep not yet in the working map
-    if r not in mp:
-        mp[r] = _seed_rep(r)
+    base_map, map_sources = base_mapping()
+mp = working_mapping(base_map)
 
 shop_map = {r: v["shop"] for r, v in mp.items() if v.get("shop")}
 manager_map = {r: v["manager"] for r, v in mp.items() if v.get("manager")}
@@ -1331,44 +1373,10 @@ if IS_ADMIN:
     with tab_map:
         st.caption("Assign each sales rep to a **Shop** and a **Manager**. Edits update the report "
                    "immediately; **Save** keeps them for next time. Add a row for any new rep.")
-        if map_source:
-            st.caption(f"📄 Reps and shops loaded from **{map_source}** ({len(file_map)} reps).")
-        else:
-            st.caption("⚠️ No mapping file found — add `shop_manager_mapping_template.numbers` "
-                       "next to the app, or load one with your data.")
-        map_df = pd.DataFrame(
-            [{"Sales Rep": r, "Shop": v.get("shop", ""), "Manager": v.get("manager", "")}
-             for r, v in sorted(mp.items())]
-        )
-        edited = st.data_editor(
-            map_df, key="map_editor", num_rows="dynamic", width="stretch", hide_index=True,
-            column_config={
-                "Sales Rep": st.column_config.TextColumn("Sales Rep", required=True),
-                "Shop": st.column_config.TextColumn("Shop", help="e.g. Charlotte, Hickory"),
-                "Manager": st.column_config.TextColumn("Manager"),
-            },
-        )
-        # Write the edited table back to the working map (drives the report on rerun).
-        newmap = {}
-        for _, row in edited.iterrows():
-            rep_name = str(row.get("Sales Rep", "")).strip()
-            if rep_name and rep_name.lower() not in ("nan", "none"):
-                newmap[rep_name] = {"shop": str(row.get("Shop") or "").strip(),
-                                    "manager": str(row.get("Manager") or "").strip()}
-        # keep any discovered rep that a delete would otherwise drop
-        for r in all_reps:
-            newmap.setdefault(r, _seed_rep(r))
-        # Remember rows the user typed in, so they survive the next rerun's prune.
-        st.session_state["manual_reps"] = {r for r in newmap if r not in file_map}
-        st.session_state["mapping"] = newmap
-
-        c1, c2, _ = st.columns([1, 1, 3])
-        if c1.button("💾 Save mapping", type="primary"):
-            gp.save_mapping(newmap)
-            st.success(f"Saved {len(newmap)} reps to config.json")
+        st.caption("📄 Reps and shops from " + " + ".join(f"**{x}**" for x in map_sources)
+                   + f" ({len(base_map)} reps).")
+        newmap = mapping_editor(base_map, "map_editor")
         n_mgr = sum(1 for v in newmap.values() if v.get("manager"))
-        n_shop = sum(1 for v in newmap.values() if v.get("shop"))
-        c2.metric("Mapped", f"{n_shop} shops · {n_mgr} mgrs")
         if n_mgr == 0:
             st.info("No managers assigned yet — fill the Manager column to enable the **Manager** "
                     "grouping, then Save.")
