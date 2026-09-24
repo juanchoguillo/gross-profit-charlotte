@@ -28,7 +28,7 @@ names can vary.
 | Customers (ReportAdHoc) | ✅ | Customer **Type** |
 | Products | ✅ | SKU → material (`Catalogs`) |
 | **2026 Template Schedule** (`.xlsx`) | optional | **Template cost** per order (one tab per templater) |
-| **2026 Install Schedule** (`.xlsb`) | optional | **Install cost** per order (one tab per installer) |
+| **2026 Install Schedule** (`.xlsb`) | optional | **Install cost** per order (`Installer_…` tabs) and **Plumbing cost** per order (`Plumber_…` tabs) |
 | **2026 Production Install LOG** (`.xlsx`) | optional | **Fabrication cost** per order (`2026` tab) |
 | **Vendor bill export** (`.xlsx`) | optional | **Additional cost** per order (e.g. *Adicional Cost - Hydroshield*) |
 | **Shop/Manager mapping** | optional | rep → shop & manager |
@@ -43,7 +43,7 @@ names can vary.
 | **SqFt Allocated** | stone `AllocationMeasure` |
 | **Install Cost** | Install Schedule amount per order; orders with none share the **Install total cost $** (sidebar, default 0) by their SqFt |
 | **Fabrication Cost** | Production LOG amount per order; orders with none fall back to `SqFt Billed × fab fixed cost rate` (sidebar, default 0) |
-| **Plumbing Cost** | typed per order in the **📑 Orders** tab (no export carries it) |
+| **Plumbing Cost** | Install Schedule `Plumber_…` tabs, per order; also typeable per order in the **📑 Orders** tab |
 | **Additional Costs** | vendor bill exports, matched by the order number in each bill's Memo; also typeable per order in the **📑 Orders** tab — the catch-all for anything the other cost columns don't cover |
 | **Operational Cost** | Template + Install + Fabrication + Plumbing + Additional, per order |
 | **Overhead** | `SqFt Billed × fixed cost rate` (default 0, editable) |
@@ -64,18 +64,20 @@ Both land in the full Excel export as the **Other Breakdown** and
 
 ## Operational cost — Template, Install, Fabrication, Plumbing & Additional
 
-Template, Install, Fabrication and Additional come from four workbooks, joined to
-each order:
+Template, Install, Fabrication, Plumbing and Additional come from four workbooks,
+joined to each order:
 
 | File | Tabs read | Order column | Cost column |
 |---|---|---|---|
 | **Template Schedule** (`.xlsx` / `.xlsm`) | `Templater_<name>` (e.g. `Templater_Frankie`) — older files: one tab per templater (Ricardo, Caio, Michael) | `Order Id` (older: `Order No.`) | `Total Final Paid` (older: `Per Order`) |
 | **Install Schedule** (`.xlsm` / `.xlsb`) | `Installer_<name>` (e.g. `Installer_EliteStone`) — older files: one tab per installer (Oscar, Flavio, …) | `Order Id` (older: `Order #`) | `Total Final Paid` (older: `Total`) |
+| **Install Schedule** (same file) | `Plumber_<name>` (e.g. `Plumber_Oscar`, `Plumber_Kirk`) → **Plumbing Cost** | `Order Id` | `Total Final Paid` (their `Total` column is left at 0) |
 | **Production Install LOG** (`.xlsx`) | the `2026` tab | `ORDER` | `Total Amount` (summed — multiple lines per order) |
 | **Vendor bill export** (`.xlsx`) | every tab | `Memo` (order number read out of the free text) | `Debit` |
 
 **Tab naming decides the file.** A workbook with `Installer_…` tabs is the install
-schedule, one with `Templater_…` tabs is the template schedule — so both can be
+schedule, one with `Templater_…` tabs is the template schedule, and `Plumber_…`
+tabs — which ride in the install schedule — feed Plumbing Cost — so both can be
 exported straight from the ERP with the raw `Invoice List` / `Sales Person
 Summary` tabs still attached; those are ignored, not read.
 
@@ -102,6 +104,9 @@ they all add into **Additional Costs**.
   banners** (`2026-06-01`), **`INVOICE #…` banners**, and the **blank-`Order Id`
   invoice subtotal / `MILEAGE` rows**. These carry roughly as much money as the
   order rows themselves, so counting them would nearly double the cost.
+- A crew tab whose `Order Id` header cell was left **blank** (e.g.
+  `Installer_JavierC`) is still read: its header row is found by the `Customer`
+  column and the order numbers are taken from column A.
 - A row whose cost cannot be tied to an order (blank `Order Id`) is left out of
   the report — the 🛠️ Operational tab's "cost in file" reflects only the
   assignable rows.
@@ -143,11 +148,12 @@ the month you are looking at.
 
 ### Plumbing cost & Additional costs
 
-No export carries **Plumbing Cost**, so it is typed per order: open the
-**📑 Orders** tab, turn on **✏️ Edit mode**, type the amount and **💾 Save edits**
-(stored in `order_overrides.json`, applied for every user, source files never
-touched). **Additional Costs** comes from the vendor bill exports and can be typed
-the same way — a typed amount replaces the file's for that order. Both round-trip
+**Plumbing Cost** comes from the install schedule's `Plumber_…` tabs. It can also
+be typed per order: open the **📑 Orders** tab, turn on **✏️ Edit mode**, type the
+amount and **💾 Save edits** (stored in `order_overrides.json`, applied for every
+user, source files never touched) — a typed amount replaces the file's for that
+order. **Additional Costs** comes from the vendor bill exports and can be typed
+the same way. Both round-trip
 through the Excel exports too: edit the column and re-upload the workbook.
 *Additional Costs* is the catch-all for anything the other columns don't cover.
 

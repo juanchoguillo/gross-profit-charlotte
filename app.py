@@ -123,7 +123,7 @@ def op_diag_table(od: dict) -> pd.DataFrame:
     """The Operational tab's per-file diagnostics, one row per cost type plus a
     TOTAL row. Totals only — individual tabs are counted, not listed."""
     rows = []
-    for key in ["template", "install", "fabrication", "additional"]:
+    for key in ["template", "install", "fabrication", "plumbing", "additional"]:
         v = od[key]
         rows.append({
             "Type": v["label"],
@@ -339,7 +339,7 @@ if source == "Upload files":
         type=["csv", "xlsx", "xlsm", "xls", "xlsb", "numbers"],
         accept_multiple_files=True,
         help="Sales By SKU · Invoice List · Inventory Allocation · Sales Person Summary · "
-        "Customer (ReportAdHoc) · Products · Template Schedule · Install Schedule (.xlsb) · "
+        "Customer (ReportAdHoc) · Products · Template Schedule · Install Schedule (Installer_ / Plumber_ tabs) · "
         "Production LOG (operational cost) · vendor bill exports (additional cost) · "
         "and optionally a rep→shop→manager mapping file.",
     )
@@ -363,6 +363,7 @@ REQUIRED = {
 OPTIONAL = {
     "template_cost": "Template Schedule (template cost)",
     "install_cost": "Install Schedule (install cost)",
+    "plumbing_cost": "Install Schedule Plumber_ tabs (plumbing cost)",
     "fabrication_cost": "Production LOG (fabrication cost)",
     "additional_cost": "Vendor bills (additional cost)",
     "rep_map": "Shop/Manager mapping",
@@ -692,7 +693,7 @@ if IS_ADMIN:
     if not has_op_amount:
         st.info("ℹ️ No operational cost yet → Operational Cost is $0. Add the "
                 "**Template Schedule**, **Install Schedule** (.xlsb), **Production LOG** and "
-                "**vendor bill exports** to capture template / installation / "
+                "**vendor bill exports** to capture template / installation / plumbing / "
                 "fabrication / additional cost — or set a **Fab fixed cost $/SqFt** "
                 "or an **Install total cost $** in the sidebar and type plumbing / "
                 "additional cost per order in the **Orders** tab.")
@@ -1312,7 +1313,7 @@ if IS_ADMIN:
         if not has_op_amount:
             st.info("No operational cost yet. Add the **Template Schedule**, "
                     "**Install Schedule** (.xlsb), **Production LOG** and **vendor bill "
-                    "exports** to capture template / installation / fabrication / "
+                    "exports** to capture template / installation / plumbing / fabrication / "
                     "additional cost per order — or set a **Fab fixed cost $/SqFt** or an "
                     "**Install total cost $** in the sidebar and type plumbing / "
                     "additional cost per order in the **Orders** tab. File-based cost attaches to an "
@@ -1362,7 +1363,7 @@ if IS_ADMIN:
             st.caption("One row per cost type — crew tabs are summed together, not "
                        "broken out. This table covers the **source files only**: "
                        "fab cost derived from the $/SqFt rate, install cost derived from "
-                       "the install total, and hand-typed plumbing / additional cost are "
+                       "the install total, and hand-typed cost are "
                        "not in it. **In file** = everything in the "
                        "source workbook "
                        "(all crew tabs, double-counting tabs excluded). **Applied (period)** "
