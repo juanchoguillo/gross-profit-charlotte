@@ -20,8 +20,9 @@ Data model (per Juan's spec):
                          are pulled from the three schedule workbooks (one tab
                          per crew member), joined on the numeric OrderID;
                          Additional also picks up the vendor bill exports
-                         (order id read out of the bill Memo); Plumbing is typed
-                         per order in the app (no source export carries it).
+                         (order id read out of the bill Memo); Plumbing comes
+                         from the 'Plumber_<name>' tabs of the Install Schedule
+                         and can still be typed per order in the app.
   Fabrication Cost     = the Production LOG amount when the order has one,
                          otherwise SqFt Billed * fab_rate (the fab fixed cost
                          $/sqft, default 0 -> no fallback)
@@ -426,23 +427,23 @@ def load_files(sources: list[tuple]) -> tuple[dict, list]:
             op = None
             notes.append(f"{name} (op-cost parse failed: {exc})")
         if op is not None:
-            role, payload = op
-            if role in opcost:                       # 2nd file of same kind -> merge
-                opcost[role]["map"] = opcost[role]["map"].add(payload["map"], fill_value=0)
-                opcost[role]["diag"]["rows"] += payload["diag"]["rows"]
-                opcost[role]["diag"]["sheets"] += payload["diag"]["sheets"]
-                opcost[role]["diag"]["total_in_file"] += payload["diag"]["total_in_file"]
-                opcost[role]["diag"]["vendors"] = sorted(
-                    set(opcost[role]["diag"].get("vendors", []))
-                    | set(payload["diag"].get("vendors", [])))
-                opcost[role]["diag"]["orders_in_file"] = int(opcost[role]["map"].size)
-            else:
-                opcost[role] = payload
-            d = payload["diag"]
-            who = f" ({', '.join(d['vendors'])})" if d.get("vendors") else ""
-            notes.append(f"{d['label']} cost: {d['rows']:,} rows from "
-                         f"{len(d['sheets'])} "
-                         f"{_OPCOST_SPECS[role].get('tab_word', 'crew tab(s)')}{who}")
+            for role, payload in op:
+                if role in opcost:                   # 2nd file of same kind -> merge
+                    opcost[role]["map"] = opcost[role]["map"].add(payload["map"], fill_value=0)
+                    opcost[role]["diag"]["rows"] += payload["diag"]["rows"]
+                    opcost[role]["diag"]["sheets"] += payload["diag"]["sheets"]
+                    opcost[role]["diag"]["total_in_file"] += payload["diag"]["total_in_file"]
+                    opcost[role]["diag"]["vendors"] = sorted(
+                        set(opcost[role]["diag"].get("vendors", []))
+                        | set(payload["diag"].get("vendors", [])))
+                    opcost[role]["diag"]["orders_in_file"] = int(opcost[role]["map"].size)
+                else:
+                    opcost[role] = payload
+                d = payload["diag"]
+                who = f" ({', '.join(d['vendors'])})" if d.get("vendors") else ""
+                notes.append(f"{d['label']} cost: {d['rows']:,} rows from "
+                             f"{len(d['sheets'])} "
+                             f"{_OPCOST_SPECS[role].get('tab_word', 'crew tab(s)')}{who}")
             continue
         try:
             df = _read_any(io.BytesIO(raw), name)
@@ -565,6 +566,14 @@ _OPCOST_SPECS = {
         # "SQF Paid" only exists on the real per-installer tabs, not the overview.
         "guard_aliases": ["sqf paid"],
     },
+    # 'Plumber_<name>' tabs ride in the same workbook as the 'Installer_' tabs.
+    # Their "Total" column is left at 0 -- the amount lives in "Total Final Paid".
+    "plumbing_cost": {
+        "label": "Plumbing",
+        "order_aliases": ["order id", "order #", "order#", "order no.", "order no"],
+        "value_aliases": ["total final paid"],
+        "guard_aliases": ["total final paid"],
+    },
     "fabrication_cost": {
         "label": "Fabrication",
         "order_aliases": ["order"],
@@ -601,6 +610,7 @@ _YEAR_SHEET = re.compile(r"^\s*20\d\d\s*$")
 # such as the Production LOG's 'INSTALLS-2026'.
 _CREW_SHEET_RE = {
     "install_cost": re.compile(r"^\s*installers?_", re.I),
+    "plumbing_cost": re.compile(r"^\s*plumbers?_", re.I),
     "template_cost": re.compile(r"^\s*templat(?:e|er|ers)?_", re.I),
 }
 
@@ -656,24 +666,41 @@ def _pick_col(df: pd.DataFrame, aliases):
     return None
 
 
-def _find_header_row(book, sheet, engine, order_aliases) -> int | None:
+def _find_header_row(book, sheet, engine, order_aliases,
+                     crew=False) -> tuple[int, bool] | None:
     """Find the row that holds the column headers (these workbooks often carry a
-    banner row, e.g. '2026', above the real header)."""
+    banner row, e.g. '2026', above the real header). Returns (row, blank_order)
+    -- blank_order is True when a crew tab left its 'Order Id' header cell
+    empty (e.g. 'Installer_JavierC'): the header row is then recognised by its
+    'Customer' column and the order numbers are read from column A."""
     raw = pd.read_excel(book, sheet, header=None, nrows=12, engine=engine)
     for i in range(len(raw)):
         vals = {str(x).strip().lower() for x in raw.iloc[i].tolist()}
         if any(a in vals for a in order_aliases):
-            return i
+            return i, False
+    if crew:
+        for i in range(len(raw)):
+            row = raw.iloc[i].tolist()
+            vals = {str(x).strip().lower() for x in row}
+            if pd.isna(row[0]) and "customer" in vals:
+                return i, True
     return None
 
 
-def _classify_opcost(book, engine) -> str | None:
-    """Decide whether a workbook is the Template / Install / Fabrication schedule
-    by sniffing the column names present on any of its sheets."""
-    for role, rx in _CREW_SHEET_RE.items():
-        if any(rx.match(str(s)) for s in book.sheet_names):
-            return role
+def _classify_opcost(book, engine) -> list[str]:
+    """Decide which operational-cost roles a workbook carries. Crew-tab prefixes
+    win and can name several roles at once (the Install Schedule holds both
+    'Installer_' and 'Plumber_' tabs); otherwise the column names present on
+    its sheets pick a single role."""
+    roles = [role for role, rx in _CREW_SHEET_RE.items()
+             if any(rx.match(str(s)) for s in book.sheet_names)]
+    if roles:
+        return roles
+    role = _classify_by_columns(book, engine)
+    return [role] if role else []
 
+
+def _classify_by_columns(book, engine) -> str | None:
     cols = set()
     for sheet in book.sheet_names[:30]:
         try:
@@ -702,9 +729,10 @@ def _classify_opcost(book, engine) -> str | None:
 
 
 def parse_opcost_workbook(raw: bytes, name: str):
-    """If `raw` is one of the operational-cost schedule workbooks, return
-    (role, payload) where payload = {'map': Series(order_key -> cost),
-    'diag': {...}}.  Returns None for anything else."""
+    """If `raw` is one of the operational-cost schedule workbooks, return a list
+    of (role, payload) -- one per cost type it carries -- where payload =
+    {'map': Series(order_key -> cost), 'diag': {...}}.  Returns None for
+    anything else."""
     if not str(name).lower().endswith((".xlsx", ".xlsm", ".xls", ".xlsb")):
         return None
     engine = _excel_engine(name)
@@ -712,9 +740,13 @@ def parse_opcost_workbook(raw: bytes, name: str):
         book = pd.ExcelFile(io.BytesIO(raw), engine=engine)
     except Exception:  # noqa: BLE001
         return None
-    role = _classify_opcost(book, engine)
-    if role is None:
-        return None
+    found = [(role, payload) for role in _classify_opcost(book, engine)
+             if (payload := _parse_opcost_role(book, engine, role)) is not None]
+    return found or None
+
+
+def _parse_opcost_role(book, engine, role):
+    """Sum one cost type's per-order amounts out of an opened workbook."""
     spec = _OPCOST_SPECS[role]
 
     per_order: dict = {}
@@ -728,12 +760,14 @@ def parse_opcost_workbook(raw: bytes, name: str):
             continue
         if spec.get("year_sheets_only") and not _YEAR_SHEET.match(str(sheet)):
             continue
-        h = _find_header_row(book, sheet, engine, spec["order_aliases"])
-        if h is None:
+        found = _find_header_row(book, sheet, engine, spec["order_aliases"],
+                                 crew=bool(crew))
+        if found is None:
             continue
+        h, blank_order = found
         df = pd.read_excel(book, sheet, header=h, engine=engine)
         df.columns = [str(c).strip() for c in df.columns]
-        oc = _pick_col(df, spec["order_aliases"])
+        oc = df.columns[0] if blank_order else _pick_col(df, spec["order_aliases"])
         vc = _pick_col(df, spec["value_aliases"])
         if oc is None or vc is None or _pick_col(df, spec["guard_aliases"]) is None:
             continue
@@ -756,7 +790,7 @@ def parse_opcost_workbook(raw: bytes, name: str):
     diag = {"label": spec["label"], "sheets": sheets_used, "rows": rows_used,
             "orders_in_file": int(series.size), "total_in_file": total_in_file,
             "vendors": sorted(set(vendors))}
-    return role, {"map": series, "diag": diag}
+    return {"map": series, "diag": diag}
 
 
 # --------------------------------------------------------------------------
@@ -981,13 +1015,14 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
         al_id_sample = list(nonblank.drop_duplicates().head(10))
         inv_id_sample = sorted(month_orders)[:10]
 
-    # ---- Operational cost = Template + Install + Fabrication + Additional,
-    # joined by order ----
+    # ---- Operational cost = Template + Install + Fabrication + Plumbing +
+    # Additional, joined by order ----
     def _opmap(role):
         return data[role]["map"] if role in data else pd.Series(dtype=float)
     template_by_order = _opmap("template_cost")
     install_by_order = _opmap("install_cost")
     fab_by_order = _opmap("fabrication_cost")
+    plumbing_by_order = _opmap("plumbing_cost")
     additional_by_order = _opmap("additional_cost")
 
     # ---- Per-order frame ----
@@ -1022,10 +1057,11 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     # kept so an edit to Sq Ft (Stone) re-drives the rate-based orders only.
     o["FabFromLog"] = o["OrderID"].map(fab_by_order).fillna(0)
     o["FabricationCost"] = _fab_cost(o, cfg)
-    # Plumbing has no source export — it is typed per order in the Orders tab
-    # and stored in order_overrides.json. Additional comes from the vendor bill
-    # exports and can be overridden (or typed from scratch) the same way.
-    o["PlumbingCost"] = 0.0
+    # Plumbing comes from the Install Schedule's 'Plumber_' tabs; Additional from
+    # the vendor bill exports. Either can be overridden (or typed from scratch)
+    # per order in the Orders tab and stored in order_overrides.json.
+    o["PlumbingFromFile"] = o["OrderID"].map(plumbing_by_order).fillna(0)
+    o["PlumbingCost"] = o["PlumbingFromFile"]
     o["AdditionalFromFile"] = o["OrderID"].map(additional_by_order).fillna(0)
     o["AdditionalCost"] = o["AdditionalFromFile"]
     o["OperationalCost"] = (o["TemplateCost"] + o["InstallCost"]
@@ -1122,6 +1158,7 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     for role, key, srccol in [("template_cost", "template", "TemplateCost"),
                               ("install_cost", "install", "InstallFromFile"),
                               ("fabrication_cost", "fabrication", "FabFromLog"),
+                              ("plumbing_cost", "plumbing", "PlumbingFromFile"),
                               ("additional_cost", "additional", "AdditionalFromFile")]:
         d = data[role]["diag"] if role in data else {}
         op_diag[key] = {
@@ -1171,6 +1208,7 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
                                     & (o["InstallCost"] != 0)).sum()),
         "install_rate_total": float(o.loc[o["InstallFromFile"] == 0, "InstallCost"].sum()),
         "install_uncovered_orders": int((o["InstallFromFile"] == 0).sum()),
+        "plumbing_file_total": float(o["PlumbingFromFile"].sum()),
         "additional_file_total": float(o["AdditionalFromFile"].sum()),
         "has_manager_map": bool(cfg.manager_map),
         "income_total": float(o["Income"].sum()),
