@@ -1100,10 +1100,16 @@ def compute(data: dict, cfg: Config, period: str | None = None) -> Report:
     colors["Color"] = colors["Color"].where(
         colors["Color"].notna() & colors["Color"].astype(str).str.strip().ne(""),
         colors["SKU"])
+    # Ranked by SqFt sold: these are the same lines that make up each order's
+    # Sq Ft (Stone), so the SqFt column sums to the Orders tab's stone total.
+    # SKUs lists every sale SKU rolled into the color (SKUs sharing one Title).
     by_color = (colors.groupby(["Color", "Material"], as_index=False)
-                .agg(SqFt=("Quantity", "sum"), Revenue=("Extended", "sum"),
+                .agg(SKUs=("SKU", lambda s: ", ".join(sorted(s.unique()))),
+                     SqFt=("Quantity", "sum"), Revenue=("Extended", "sum"),
                      Orders=("OrderID", "nunique"))
-                .sort_values("Revenue", ascending=False).reset_index(drop=True))
+                .sort_values(["SqFt", "Revenue"], ascending=False).reset_index(drop=True))
+    by_color.insert(4, "% of SqFt",
+                    by_color["SqFt"] / sqft_stone_total if sqft_stone_total else np.nan)
     by_color["AvgPrice"] = np.where(by_color["SqFt"] != 0,
                                     by_color["Revenue"] / by_color["SqFt"], np.nan)
 

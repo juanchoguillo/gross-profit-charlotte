@@ -1190,19 +1190,42 @@ with tab_drill:
 
 if IS_ADMIN:
     with tab_material:
-        st.subheader("Top countertop colors")
-        st.caption("Stone slab lines only, named by the Products **Title** field, ranked by "
-                   "revenue. SqFt here is billed stone square footage.")
+        st.subheader("Top 21 stone colors by Sq Ft sold")
+        st.caption("Each order's **Sq Ft (Stone)** lines, joined by **SKU** to the Products "
+                   "**Title** to get the stone name, then ranked by square footage sold. "
+                   "SKUs that share the same Title roll up into one color.")
         topn = rep.by_color.head(21).copy()
         if len(topn):
             topn.insert(0, "Rank", range(1, len(topn) + 1))
-            tc = topn.rename(columns={"AvgPrice": "Avg $/SqFt"})
-            st.dataframe(tc.style.format({"SqFt": "{:,.2f}", "Revenue": "${:,.2f}",
-                                          "Avg $/SqFt": "${:,.2f}"}),
+            tc = topn.rename(columns={"SqFt": "Sq Ft (Stone)", "AvgPrice": "Avg $/SqFt"})
+
+            tc_rank = tc.iloc[::-1]                    # largest ends up on top
+            figc = go.Figure(go.Bar(
+                x=tc_rank["Sq Ft (Stone)"], y=tc_rank["Color"], orientation="h",
+                marker_color=PALETTE[0],
+                text=[f"{v:,.0f} sqft" for v in tc_rank["Sq Ft (Stone)"]],
+                textposition="outside", cliponaxis=False,
+                customdata=tc_rank[["SKUs", "% of SqFt"]],
+                hovertemplate="%{y}<br>%{x:,.2f} sqft (%{customdata[1]:.1%})"
+                              "<br>SKUs: %{customdata[0]}<extra></extra>"))
+            figc.update_layout(
+                title="Sq Ft (Stone) sold by color",
+                height=max(340, 30 * len(tc_rank) + 120),
+                xaxis=dict(tickformat=",.0f"), margin=dict(r=90))
+            st.plotly_chart(figc, width="stretch")
+
+            st.dataframe(tc.style.format({"Sq Ft (Stone)": "{:,.2f}", "% of SqFt": "{:.1%}",
+                                          "Revenue": "${:,.2f}", "Avg $/SqFt": "${:,.2f}"}),
                          width="stretch", hide_index=True,
                          height=min(60 + 35 * len(tc), TABLE_H))
-            st.caption(f"Top {len(tc)} of {len(rep.by_color):,} colors sold this period — "
-                       "the full list is in the Excel export.")
+            top_sqft = tc["Sq Ft (Stone)"].sum()
+            all_sqft = rep.by_color["SqFt"].sum()
+            st.caption(f"Top {len(tc)} of {len(rep.by_color):,} colors sold this period = "
+                       f"{top_sqft:,.2f} of {all_sqft:,.2f} stone sqft "
+                       f"({top_sqft / all_sqft:.1%}). The all-colors total matches the "
+                       "Orders tab's Sq Ft (Stone) total (before hand edits); the full list is in the Excel "
+                       "export (Countertop Colors sheet)." if all_sqft else
+                       f"Top {len(tc)} of {len(rep.by_color):,} colors sold this period.")
         else:
             st.info("No stone slab lines this period.")
 

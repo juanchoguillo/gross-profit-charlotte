@@ -491,7 +491,8 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
                       databars=[("Revenue", GOLD)])
     if by_color is not None and len(by_color):
         _simple_sheet(wb, F, "Countertop Colors", by_color,
-                      databars=[("Revenue", GOLD)], widths={"Color": 35.5})
+                      databars=[("SqFt", GOLD)], kinds={"SKUs": "text"},
+                      widths={"Color": 35.5, "SKUs": 30})
 
     # The "Other" material bucket, opened up: what the uncategorised SKUs are,
     # then every line of them with the order it was billed on.
