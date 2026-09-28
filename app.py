@@ -828,7 +828,9 @@ with tab_summary:
             sg_table if IS_ADMIN else pd.DataFrame(),
             group_by, fixed_rate=overhead_rate, fab_rate=fab_rate,
             install_rate=install_rate, income_basis=income_basis,
-            period=rep.meta["period"], basis_label=basis_label)
+            period=rep.meta["period"], basis_label=basis_label,
+            by_color=rep.by_color.rename(columns={"AvgPrice": "Avg $/SqFt"})
+            if IS_ADMIN else None)
         st.download_button("⬇️ Download report (Excel)", data=report_xlsx,
                            file_name=f"Gross Profit {rep.meta['period']} by {group_by}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1223,8 +1225,9 @@ if IS_ADMIN:
             st.caption(f"Top {len(tc)} of {len(rep.by_color):,} colors sold this period = "
                        f"{top_sqft:,.2f} of {all_sqft:,.2f} stone sqft "
                        f"({top_sqft / all_sqft:.1%}). The all-colors total matches the "
-                       "Orders tab's Sq Ft (Stone) total (before hand edits); the full list is in the Excel "
-                       "export (Countertop Colors sheet)." if all_sqft else
+                       "Orders tab's Sq Ft (Stone) total (before hand edits). Both Excel downloads "
+                       "include this ranking (Top 21 Colors sheet); the full export also "
+                       "has every color (Countertop Colors sheet)." if all_sqft else
                        f"Top {len(tc)} of {len(rep.by_color):,} colors sold this period.")
         else:
             st.info("No stone slab lines this period.")

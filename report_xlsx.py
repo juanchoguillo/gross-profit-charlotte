@@ -399,7 +399,8 @@ def _orders_sheet(wb, F, df):
 def _avg_formula(df, letters):
     """Ratio column (Avg $/unit, Avg $/SqFt, AvgPrice) = Revenue / base col."""
     avg = next((c for c in df.columns if str(c).lower().startswith("avg")), None)
-    base = next((c for c in ("Quantity", "SqFt") if c in df.columns), None)
+    base = next((c for c in ("Quantity", "SqFt", "Sq Ft (Stone)") if c in df.columns),
+                None)
     if not avg or not base or "Revenue" not in df.columns:
         return None
     return avg, lambda xr: (f'=IFERROR({letters["Revenue"]}{xr}'
@@ -423,12 +424,46 @@ def _simple_sheet(wb, F, name, df, *, databars=(), avg=True, fill_of=_zebra,
     return ws
 
 
+TOP_COLORS = 21
+
+
+def _top_colors_sheet(wb, F, by_color, n=TOP_COLORS):
+    """The Material tab's "Top 21 stone colors by Sq Ft sold": ranked table
+    plus a native bar chart, largest color on top."""
+    top = (by_color.head(n).rename(columns={"SqFt": "Sq Ft (Stone)"})
+           .reset_index(drop=True))
+    top.insert(0, "Rank", range(1, len(top) + 1))
+    name = f"Top {n} Colors"
+    ws = _simple_sheet(wb, F, name, top, databars=[("Sq Ft (Stone)", GOLD)],
+                       kinds={"Rank": "int", "SKUs": "text"},
+                       widths={"Rank": 7, "Color": 35.5, "SKUs": 30})
+
+    cols = list(top.columns)
+    c_color, c_sqft = cols.index("Color"), cols.index("Sq Ft (Stone)")
+    last = len(top)
+    chart = wb.add_chart({"type": "bar"})
+    chart.add_series({
+        "name": "Sq Ft (Stone)",
+        "categories": [name, 1, c_color, last, c_color],
+        "values": [name, 1, c_sqft, last, c_sqft],
+        "fill": {"color": NAVY}, "gap": 40,
+        "data_labels": {"value": True, "num_format": "#,##0"},
+    })
+    chart.set_title({"name": "Sq Ft (Stone) sold by color"})
+    chart.set_legend({"none": True})
+    chart.set_y_axis({"reverse": True})          # rank 1 on top
+    chart.set_x_axis({"num_format": "#,##0", "major_gridlines": {"visible": True}})
+    chart.set_size({"width": 720, "height": max(340, 24 * last + 110)})
+    ws.insert_chart(last + 3, 1, chart)
+    return ws
+
+
 def build_full_export(orders_nm, summary, by_material, by_color, by_customer_type,
                       by_service_group, op_diag_df, mapping_df, group_by, *,
                       fixed_rate=0.0, fab_rate=0.0, install_rate=0.0,
                       income_basis="billed", period="",
                       basis_label="", subtitle=None,
-                      by_other=None, other_lines=None):
+                      by_other=None, other_lines=None, all_colors=True):
     """One workbook mirroring every dashboard tab — cover + one sheet per tab,
     with live formulas throughout (see module docstring)."""
     orders = orders_nm.copy()
@@ -490,6 +525,8 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
         _simple_sheet(wb, F, "By Material", by_material,
                       databars=[("Revenue", GOLD)])
     if by_color is not None and len(by_color):
+        _top_colors_sheet(wb, F, by_color)
+    if all_colors and by_color is not None and len(by_color):
         _simple_sheet(wb, F, "Countertop Colors", by_color,
                       databars=[("SqFt", GOLD)], kinds={"SKUs": "text"},
                       widths={"Color": 35.5, "SKUs": 30})
@@ -580,17 +617,17 @@ def build_full_export(orders_nm, summary, by_material, by_color, by_customer_typ
 
 
 # --------------------------------------------------------------------------
-# the summary-tab report — same workbook minus the colors/diagnostics/mapping
-# sheets, and the orders sheet in the SAME original "Orders — Net Margin"
+# the summary-tab report — same workbook minus the full colors list and the
+# diagnostics/mapping sheets (the Top 21 Colors ranking is kept), and the orders sheet in the SAME original "Orders — Net Margin"
 # layout (columns + names) as the full report.
 # --------------------------------------------------------------------------
 def build_report_excel(orders_nm, summary, by_material, by_customer_type,
                        by_service_group, group_by, *, fixed_rate=0.0, fab_rate=0.0,
                        install_rate=0.0, income_basis="billed", period="",
-                       basis_label=""):
+                       basis_label="", by_color=None):
     return build_full_export(
-        orders_nm, summary, by_material, None, by_customer_type,
+        orders_nm, summary, by_material, by_color, by_customer_type,
         by_service_group, None, None, group_by,
         fixed_rate=fixed_rate, fab_rate=fab_rate, install_rate=install_rate,
         income_basis=income_basis, period=period, basis_label=basis_label,
-        subtitle=f"Summary report by {group_by}")
+        subtitle=f"Summary report by {group_by}", all_colors=False)
